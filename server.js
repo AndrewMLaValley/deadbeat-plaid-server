@@ -1,186 +1,197 @@
-// server.js
-// Description: Minimal Express server to handle Plaid link token creation,
-// public token exchange, and fetching linked accounts from Supabase.
+require('dotenv').config();
+   const express = require('express');
+   const cors = require('cors');
+   const { Pool } = require('pg');
+   const { plaidClient } = require('./plaidClient');
 
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
-import { createClient } from "@supabase/supabase-js";
+   const app = express();
+   app.use(cors());
+   app.use(express.json());
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+   // Connect to Supabase Postgres
+   const pool = new Pool({
+     connectionString: process.env.DATABASE_URL,
+   });
 
-// Environment variables (to be set in Render)
-const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
-const PLAID_SECRET = process.env.PLAID_SECRET;
-const PLAID_ENV = process.env.PLAID_ENV || "sandbox";
+   // Health check
+   app.get('/', (req, res) => {
+     res.json({ ok: true });
+   });
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+   // Create a Plaid Link token
+   app.post('/create-link-token', async (req, res) => {
+     try {
+       const authHeader = req.headers.authorization || '';
+       const jwt = authHeader.replace('Bearer ', '').trim();
 
-// Initialize Plaid client
-const plaidConfig = new Configuration({
-  basePath: PlaidEnvironments[PLAID_ENV],
-  baseOptions: {
-    headers: {
-      "PLAID-CLIENT-ID": PLAID_CLIENT_ID,
-      "PLAID-SECRET": PLAID_SECRET
-    }
-  }
-});
+       if (!jwt) {
+         return res.status(401).json({ error: 'Missing JWT' });
+       }
 
-const plaidClient = new PlaidApi(plaidConfig);
+       const { tracker_id } = req.body;
+       if (!tracker_id) {
+         return res.status(400).json({ error: 'tracker_id is required' });
+       }
 
-// Initialize Supabase client (service role, server-side only)
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+       const request = {
+         user: {
+           client_user_id: tracker_id,
+         },
+         client_name: 'Deadbeat Tracker',
+         products: ['auth', 'transactions'],
+         country_codes: ['US'],
+         language: 'en',
+       };
 
-// Helper: get Supabase user from JWT (same token your front-end uses)
-async function getUserFromJwt(jwt) {
-  if (!jwt) return null;
-  const { data, error } = await supabase.auth.getUser(jwt);
-  if (error) {
-    console.error("Supabase getUser error:", error);
-    return null;
-  }
-  return data.user;
-}
+       const response = await plaidClient.linkTokenCreate(request);
+       return res.json({ link_token: response.data.link_token });
+     } catch (err) {
+       console.error('create-link-token error', err.response?.data || err);
+       return res.status(500).json({ error: 'Failed to create link token' });
+     }
+   });
 
-// Route: create Plaid link token
-app.post("/plaid-create-link-token", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const jwt = authHeader.replace("Bearer ", "");
-    const user = await getUserFromJwt(jwt);
+   // Exchange public_token and store accounts
+   app.post('/exchange-public-token', async (req, res) => {
+     const authHeader = req.headers.authorization || '';
+     const jwt = authHeader.replace('Bearer ', '').trim();
+     if (!jwt) {
+       return res.status(401).json({ error: 'Missing JWT' });
+     }
 
-    if (!user) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
+     const { public_token, tracker_id } = req.body;
+     if (!public_token || !tracker_id) {
+       return res.status(400).json({ error: 'public_token and tracker_id are required' });
+     }
 
-    const { tracker_id } = req.body;
-    if (!tracker_id) {
-      return res.status(400).json({ error: "tracker_id is required" });
-    }
+     const client = await pool.connect();
+     try {
+       // 1) Exchange public_token
+       const tokenResponse = await plaidClient.itemPublicTokenExchange({ public_token });
+       const access_token = tokenResponse.data.access_token;
+       const item_id = tokenResponse.data.item_id;
 
-    const linkResponse = await plaidClient.linkTokenCreate({
-      user: {
-        client_user_id: user.id
-      },
-      client_name: "Deadbeat Tracker",
-      products: ["transactions"],
-      language: "en",
-      country_codes: ["US"]
-    });
+       // 2) Upsert into plaid_items
+       await client.query(
+         `
+         insert into public.plaid_items (tracker_id, plaid_item_id, access_token)
+         values ($1, $2, $3)
+         on conflict (plaid_item_id) do update set access_token = excluded.access_token
+         `,
+         [tracker_id, item_id, access_token]
+       );
 
-    res.json({
-      link_token: linkResponse.data.link_token,
-      tracker_id
-    });
-  } catch (err) {
-    console.error("plaid-create-link-token error:", err);
-    res.status(500).json({ error: "Failed to create Plaid link token" });
-  }
-});
+       // 3) Get accounts from Plaid
+       const accountsResponse = await plaidClient.accountsGet({ access_token });
+       const { accounts } = accountsResponse.data;
 
-// Route: exchange public_token and store linked accounts
-app.post("/plaid-exchange-public-token", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const jwt = authHeader.replace("Bearer ", "");
-    const user = await getUserFromJwt(jwt);
+       // 4) Upsert accounts into linked_accounts
+       for (const acct of accounts) {
+         const {
+           account_id,
+           name,
+           mask,
+           official_name,
+           subtype,
+           type,
+           balances,
+         } = acct;
 
-    if (!user) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
+         const current_balance = balances.current;
+         const available_balance = balances.available;
 
-    const { public_token, tracker_id } = req.body;
-    if (!public_token || !tracker_id) {
-      return res.status(400).json({ error: "public_token and tracker_id are required" });
-    }
+         await client.query(
+           `
+           insert into public.linked_accounts (
+             tracker_id,
+             plaid_item_id,
+             plaid_account_id,
+             institution_name,
+             plaid_account_name,
+             plaid_account_mask,
+             plaid_account_type,
+             plaid_account_subtype,
+             current_balance,
+             available_balance
+           )
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           on conflict (plaid_account_id) do update set
+             institution_name = excluded.institution_name,
+             plaid_account_name = excluded.plaid_account_name,
+             plaid_account_mask = excluded.plaid_account_mask,
+             plaid_account_type = excluded.plaid_account_type,
+             plaid_account_subtype = excluded.plaid_account_subtype,
+             current_balance = excluded.current_balance,
+             available_balance = excluded.available_balance
+           `,
+           [
+             tracker_id,
+             item_id,
+             account_id,
+             official_name || name || null,
+             name || official_name || 'Account',
+             mask || null,
+             type || null,
+             subtype || null,
+             current_balance,
+             available_balance,
+           ]
+         );
+       }
 
-    const exchangeResponse = await plaidClient.itemPublicTokenExchange({
-      public_token
-    });
+       return res.json({ success: true });
+     } catch (err) {
+       console.error('exchange-public-token error', err.response?.data || err);
+       return res.status(500).json({ error: 'Failed to exchange public token' });
+     } finally {
+       client.release();
+     }
+   });
 
-    const accessToken = exchangeResponse.data.access_token;
-    const itemId = exchangeResponse.data.item_id;
+   // Get linked accounts for a tracker
+   app.get('/linked-accounts', async (req, res) => {
+     const authHeader = req.headers.authorization || '';
+     const jwt = authHeader.replace('Bearer ', '').trim();
+     if (!jwt) {
+       return res.status(401).json({ error: 'Missing JWT' });
+     }
 
-    const accountsResponse = await plaidClient.accountsGet({
-      access_token: accessToken
-    });
+     const { tracker_id } = req.query;
+     if (!tracker_id) {
+       return res.status(400).json({ error: 'tracker_id is required' });
+     }
 
-    const institutionName = "USAA"; // can refine later
+     try {
+       const { rows } = await pool.query(
+         `
+         select
+           id,
+           tracker_id,
+           plaid_item_id,
+           plaid_account_id,
+           institution_name,
+           plaid_account_name,
+           plaid_account_mask,
+           plaid_account_type,
+           plaid_account_subtype,
+           current_balance,
+           available_balance
+         from public.linked_accounts
+         where tracker_id = $1
+         order by institution_name, plaid_account_name
+         `,
+         [tracker_id]
+       );
 
-    const inserts = accountsResponse.data.accounts.map((acct) => ({
-      user_id: user.id,
-      tracker_id,
-      institution_name: institutionName,
-      plaid_item_id: itemId,
-      plaid_access_token: accessToken,
-      plaid_account_id: acct.account_id,
-      plaid_account_name: acct.name,
-      plaid_account_mask: acct.mask,
-      plaid_account_type: acct.type,
-      plaid_account_subtype: acct.subtype
-    }));
+       return res.json({ accounts: rows });
+     } catch (err) {
+       console.error('linked-accounts error', err);
+       return res.status(500).json({ error: 'Failed to fetch linked accounts' });
+     }
+   });
 
-    const { error: insertError } = await supabase
-      .from("linked_bank_accounts")
-      .insert(inserts);
-
-    if (insertError) {
-      console.error("Insert linked_bank_accounts error:", insertError);
-      return res.status(500).json({ error: "Failed to save linked accounts" });
-    }
-
-    res.json({
-      success: true,
-      item_id: itemId,
-      accounts: accountsResponse.data.accounts
-    });
-  } catch (err) {
-    console.error("plaid-exchange-public-token error:", err);
-    res.status(500).json({ error: "Failed to exchange public token" });
-  }
-});
-
-// Route: fetch linked bank accounts for current user and tracker
-app.get("/linked-accounts", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const jwt = authHeader.replace("Bearer ", "");
-    const user = await getUserFromJwt(jwt);
-
-    if (!user) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
-
-    const trackerId = req.query.tracker_id;
-    if (!trackerId) {
-      return res.status(400).json({ error: "tracker_id is required" });
-    }
-
-    const { data, error } = await supabase
-      .from("linked_bank_accounts")
-      .select("*")
-      .eq("user_id", user.id)
-      .eq("tracker_id", trackerId)
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      console.error("Fetch linked accounts error:", error);
-      return res.status(500).json({ error: "Failed to load linked accounts" });
-    }
-
-    res.json({ accounts: data || [] });
-  } catch (err) {
-    console.error("linked-accounts error:", err);
-    res.status(500).json({ error: "Failed to load linked accounts" });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Plaid server listening on port ${PORT}`);
-});
+   // Start server
+   const PORT = process.env.PORT || 3000;
+   app.listen(PORT, () => {
+     console.log('Deadbeat Plaid server listening on port', PORT);
+   });
