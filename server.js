@@ -140,13 +140,20 @@ require('dotenv').config();
        }
 
        return res.json({ success: true });
-     } catch (err) {
-       console.error('exchange-public-token error', err.response?.data || err);
-       return res.status(500).json({ error: 'Failed to exchange public token' });
-     } finally {
-       client.release();
-     }
-   });
+    } catch (err) {
+    console.error('exchange-public-token error FULL:', err);
+
+    if (err.response && err.response.data) {
+      console.error('exchange-public-token error RESPONSE DATA:', err.response.data);
+    }
+
+    return res.status(500).json({
+      error: 'Failed to exchange public token',
+      details: err.response?.data || err.message || String(err),
+    });
+  } finally {
+    client.release();
+  }
 
    // Get linked accounts for a tracker
    app.get('/linked-accounts', async (req, res) => {
