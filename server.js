@@ -18,7 +18,11 @@ const pool = new Pool({
 app.get('/', (req, res) => {
   res.json({ ok: true });
 });
-
+// Simple ping route to confirm frontend can reach backend
+app.get('/ping', (req, res) => {
+  console.log('PING endpoint hit');
+  res.json({ ok: true, message: 'Backend reachable' });
+});
 // Create a Plaid Link token
 app.post('/create-link-token', async (req, res) => {
   try {
