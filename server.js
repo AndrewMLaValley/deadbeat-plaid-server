@@ -12,6 +12,7 @@ app.use(express.json());
 // Connect to Supabase Postgres via DATABASE_URL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },  // REQUIRED for Supabase on Render
 });
 
 // Health check
