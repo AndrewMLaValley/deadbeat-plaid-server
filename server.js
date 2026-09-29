@@ -38,7 +38,17 @@ app.post('/create-link-token', async (req, res) => {
     if (!tracker_id) {
       return res.status(400).json({ error: 'tracker_id is required' });
     }
-
+// Trace route to echo basic info and confirm connectivity
+app.get('/trace', (req, res) => {
+  console.log('TRACE endpoint hit');
+  res.json({
+    ok: true,
+    message: 'Trace endpoint reached',
+    time: new Date().toISOString(),
+    host: req.headers.host || null,
+    userAgent: req.headers['user-agent'] || null
+  });
+});
     const request = {
       user: { client_user_id: tracker_id },
       client_name: 'Deadbeat Tracker',
