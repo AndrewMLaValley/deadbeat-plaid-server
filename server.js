@@ -25,19 +25,56 @@ app.get('/ping', (req, res) => {
   res.json({ ok: true, message: 'Backend reachable' });
 });
 // Create a Plaid Link token
-app.post('/create-link-token', async (req, res) => {
+app.get('/linked-accounts', async (req, res) => {
+  console.log('LINKED-ACCOUNTS endpoint hit');
+
+  const authHeader = req.headers.authorization || '';
+  const jwt = authHeader.replace('Bearer ', '').trim();
+  if (!jwt) {
+    console.log('LINKED-ACCOUNTS missing JWT');
+    return res.status(401).json({ error: 'Missing JWT' });
+  }
+
+  const { tracker_id } = req.query;
+  if (!tracker_id) {
+    console.log('LINKED-ACCOUNTS missing tracker_id');
+    return res.status(400).json({ error: 'tracker_id is required' });
+  }
+
+  console.log('LINKED-ACCOUNTS for tracker_id:', tracker_id);
+
   try {
-    const authHeader = req.headers.authorization || '';
-    const jwt = authHeader.replace('Bearer ', '').trim();
+    const { rows } = await pool.query(
+      `
+      select
+        id,
+        tracker_id,
+        plaid_item_id,
+        plaid_account_id,
+        institution_name,
+        plaid_account_name,
+        plaid_account_mask,
+        plaid_account_type,
+        plaid_account_subtype,
+        current_balance,
+        available_balance
+      from public.linked_accounts
+      where tracker_id = $1
+      order by institution_name, plaid_account_name
+      `,
+      [tracker_id]
+    );
 
-    if (!jwt) {
-      return res.status(401).json({ error: 'Missing JWT' });
-    }
-
-    const { tracker_id } = req.body;
-    if (!tracker_id) {
-      return res.status(400).json({ error: 'tracker_id is required' });
-    }
+    console.log('LINKED-ACCOUNTS: found', rows.length, 'accounts');
+    return res.json({ accounts: rows });
+  } catch (err) {
+    console.error('linked-accounts error FULL:', err);
+    return res.status(500).json({
+      error: 'Failed to fetch linked accounts',
+      details: err.message || String(err),
+    });
+  }
+});
 // Trace route to echo basic info and confirm connectivity
 app.get('/trace', (req, res) => {
   console.log('TRACE endpoint hit');
