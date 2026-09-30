@@ -16,6 +16,7 @@ const pool = new Pool({
     rejectUnauthorized: false,
   },
 });
+
 // Health check
 app.get('/', (req, res) => {
   res.json({ ok: true });
@@ -35,8 +36,107 @@ app.get('/trace', (req, res) => {
     message: 'Trace endpoint reached',
     time: new Date().toISOString(),
     host: req.headers.host || null,
-    userAgent: req.headers['user-agent'] || null
+    userAgent: req.headers['user-agent'] || null,
   });
+});
+
+// Map a credit card to a linked bank account
+app.post('/card-plaid-mapping', async (req, res) => {
+  console.log('CARD-PLAID-MAPPING endpoint hit');
+
+  const authHeader = req.headers.authorization || '';
+  const jwt = authHeader.replace('Bearer ', '').trim();
+  if (!jwt) {
+    console.log('CARD-PLAID-MAPPING missing JWT');
+    return res.status(401).json({ error: 'Missing JWT' });
+  }
+
+  const { tracker_id, card_id, linked_account_id } = req.body;
+  if (!tracker_id || !card_id || !linked_account_id) {
+    console.log('CARD-PLAID-MAPPING missing fields', {
+      trackerIdPresent: !!tracker_id,
+      cardIdPresent: !!card_id,
+      linkedAccountIdPresent: !!linked_account_id,
+    });
+    return res.status(400).json({ error: 'tracker_id, card_id, and linked_account_id are required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    console.log('CARD-PLAID-MAPPING: upserting for card_id', card_id, 'linked_account_id', linked_account_id);
+
+    // Strategy: one mapping per card.
+    // If a card already has a mapping, update it to the new linked_account_id.
+    await client.query(
+      `
+      insert into public.card_plaid_mappings (tracker_id, card_id, linked_account_id)
+      values ($1, $2, $3)
+      on conflict (card_id) do update set
+        tracker_id = excluded.tracker_id,
+        linked_account_id = excluded.linked_account_id
+      `,
+      [tracker_id, card_id, linked_account_id],
+    );
+
+    console.log('CARD-PLAID-MAPPING: success for card_id', card_id);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('card-plaid-mapping error FULL:', err);
+    return res.status(500).json({
+      error: 'Failed to save card mapping',
+      details: err.message || String(err),
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Get card → linked account mappings for a tracker
+app.get('/card-plaid-mappings', async (req, res) => {
+  console.log('CARD-PLAID-MAPPINGS endpoint hit');
+
+  const authHeader = req.headers.authorization || '';
+  const jwt = authHeader.replace('Bearer ', '').trim();
+  if (!jwt) {
+    console.log('CARD-PLAID-MAPPINGS missing JWT');
+    return res.status(401).json({ error: 'Missing JWT' });
+  }
+
+  const { tracker_id } = req.query;
+  if (!tracker_id) {
+    console.log('CARD-PLAID-MAPPINGS missing tracker_id');
+    return res.status(400).json({ error: 'tracker_id is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    console.log('CARD-PLAID-MAPPINGS: fetching for tracker_id', tracker_id);
+
+    const { rows } = await client.query(
+      `
+      select
+        id,
+        tracker_id,
+        card_id,
+        linked_account_id,
+        created_at
+      from public.card_plaid_mappings
+      where tracker_id = $1
+      `,
+      [tracker_id],
+    );
+
+    console.log('CARD-PLAID-MAPPINGS: found', rows.length, 'mappings');
+    return res.json({ mappings: rows });
+  } catch (err) {
+    console.error('card-plaid-mappings error FULL:', err);
+    return res.status(500).json({
+      error: 'Failed to fetch card mappings',
+      details: err.message || String(err),
+    });
+  } finally {
+    client.release();
+  }
 });
 
 // Create a Plaid Link token
@@ -97,7 +197,10 @@ app.post('/exchange-public-token', async (req, res) => {
 
   const { public_token, tracker_id } = req.body;
   if (!public_token || !tracker_id) {
-    console.log('EXCHANGE-PUBLIC-TOKEN missing fields', { public_tokenPresent: !!public_token, trackerIdPresent: !!tracker_id });
+    console.log('EXCHANGE-PUBLIC-TOKEN missing fields', {
+      publicTokenPresent: !!public_token,
+      trackerIdPresent: !!tracker_id,
+    });
     return res.status(400).json({ error: 'public_token and tracker_id are required' });
   }
 
@@ -118,7 +221,7 @@ app.post('/exchange-public-token', async (req, res) => {
       values ($1, $2, $3)
       on conflict (plaid_item_id) do update set access_token = excluded.access_token
       `,
-      [tracker_id, item_id, access_token]
+      [tracker_id, item_id, access_token],
     );
 
     console.log('EXCHANGE-PUBLIC-TOKEN: calling accountsGet');
@@ -176,7 +279,7 @@ app.post('/exchange-public-token', async (req, res) => {
           subtype || null,
           current_balance,
           available_balance,
-        ]
+        ],
       );
     }
 
@@ -234,7 +337,7 @@ app.get('/linked-accounts', async (req, res) => {
       where tracker_id = $1
       order by institution_name, plaid_account_name
       `,
-      [tracker_id]
+      [tracker_id],
     );
 
     console.log('LINKED-ACCOUNTS: found', rows.length, 'accounts');
