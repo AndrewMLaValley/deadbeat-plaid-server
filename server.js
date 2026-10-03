@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const { Resend } = require('resend');
 const { plaidClient } = require('./plaidClient');
 
 const app = express();
@@ -16,7 +17,9 @@ const pool = new Pool({
     rejectUnauthorized: false,
   },
 });
-
+const resend = new Resend(
+  process.env.RESEND_API_KEY
+);
 // Health check
 app.get('/', (req, res) => {
   res.json({ ok: true });
@@ -27,7 +30,25 @@ app.get('/ping', (req, res) => {
   console.log('PING endpoint hit');
   res.json({ ok: true, message: 'Backend reachable' });
 });
+// Notification configuration check
+app.get('/notification-config', (req, res) => {
+  const resendConfigured =
+    !!process.env.RESEND_API_KEY;
 
+  const senderConfigured =
+    !!process.env.RESEND_FROM_EMAIL;
+
+  const jobSecretConfigured =
+    !!process.env.NOTIFICATION_JOB_SECRET;
+
+  return res.json({
+    ok: true,
+    resend_configured: resendConfigured,
+    sender_configured: senderConfigured,
+    notification_job_secret_configured:
+      jobSecretConfigured,
+  });
+});
 // Trace route to help debugging connectivity
 app.get('/trace', (req, res) => {
   console.log('TRACE endpoint hit');
