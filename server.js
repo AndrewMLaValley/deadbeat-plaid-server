@@ -350,7 +350,117 @@ app.get('/linked-accounts', async (req, res) => {
     });
   }
 });
+// Unlink one linked Plaid account from a tracker
+app.post('/unlink-account', async (req, res) => {
+  console.log('UNLINK-ACCOUNT endpoint hit');
 
+  const authHeader = req.headers.authorization || '';
+  const jwt = authHeader.replace('Bearer ', '').trim();
+
+  if (!jwt) {
+    console.log('UNLINK-ACCOUNT missing JWT');
+    return res.status(401).json({ error: 'Missing JWT' });
+  }
+
+  const { tracker_id, linked_account_id } = req.body;
+
+  if (!tracker_id || !linked_account_id) {
+    console.log('UNLINK-ACCOUNT missing fields', {
+      trackerIdPresent: !!tracker_id,
+      linkedAccountIdPresent: !!linked_account_id,
+    });
+
+    return res.status(400).json({
+      error: 'tracker_id and linked_account_id are required',
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const accountResult = await client.query(
+      `
+      select
+        id,
+        tracker_id,
+        plaid_item_id,
+        plaid_account_id,
+        institution_name,
+        plaid_account_name,
+        plaid_account_mask
+      from public.linked_accounts
+      where id = $1
+        and tracker_id = $2
+      for update
+      `,
+      [linked_account_id, tracker_id],
+    );
+
+    if (!accountResult.rows.length) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        error: 'Linked Plaid account not found for this tracker',
+      });
+    }
+
+    const linkedAccount = accountResult.rows[0];
+
+    // Remove any card → Plaid account mappings first.
+    // This prevents stale mappings from referencing the removed account.
+    await client.query(
+      `
+      delete from public.card_plaid_mappings
+      where tracker_id = $1
+        and linked_account_id = $2
+      `,
+      [tracker_id, linked_account_id],
+    );
+
+    // Remove the linked account from this tracker.
+    await client.query(
+      `
+      delete from public.linked_accounts
+      where id = $1
+        and tracker_id = $2
+      `,
+      [linked_account_id, tracker_id],
+    );
+
+    await client.query('COMMIT');
+
+    console.log(
+      'UNLINK-ACCOUNT success:',
+      linkedAccount.institution_name,
+      linkedAccount.plaid_account_name,
+    );
+
+    return res.json({
+      success: true,
+      unlinked_account_id: linked_account_id,
+      account: {
+        institution_name: linkedAccount.institution_name,
+        plaid_account_name: linkedAccount.plaid_account_name,
+        plaid_account_mask: linkedAccount.plaid_account_mask,
+      },
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+
+    console.error('unlink-account error FULL:', err);
+
+    return res.status(500).json({
+      error: 'Failed to unlink linked Plaid account',
+      details: err.message || String(err),
+    });
+
+  } finally {
+    client.release();
+  }
+});
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
