@@ -49,6 +49,70 @@ app.get('/notification-config', (req, res) => {
       jobSecretConfigured,
   });
 });
+
+// Send a protected test email through Resend
+app.post('/send-test-notification-email', async (req, res) => {
+  const jobSecret =
+    req.headers['x-notification-job-secret'];
+
+  if (
+    !jobSecret ||
+    jobSecret !== process.env.NOTIFICATION_JOB_SECRET
+  ) {
+    return res.status(401).json({
+      error: 'Unauthorized notification job request',
+    });
+  }
+
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({
+      error: 'email is required',
+    });
+  }
+
+  try {
+    const { data, error } = await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL,
+      to: [email],
+      subject: 'Deadbeat Tracker — Email Notification Test',
+      html: `
+        <h2>Deadbeat Tracker Email Test</h2>
+        <p>
+          Your Resend email notification configuration is working.
+        </p>
+        <p>
+          Minimum-payment alerts will be sent from this address
+          after the scheduled notification job is added.
+        </p>
+      `,
+    });
+
+    if (error) {
+      console.error('Resend test email error:', error);
+
+      return res.status(500).json({
+        error: 'Resend failed to send the test email',
+        details: error,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Test email sent',
+      resend_id: data?.id || null,
+    });
+
+  } catch (err) {
+    console.error('send-test-notification-email error:', err);
+
+    return res.status(500).json({
+      error: 'Unexpected test-email failure',
+      details: err.message || String(err),
+    });
+  }
+});
 // Trace route to help debugging connectivity
 app.get('/trace', (req, res) => {
   console.log('TRACE endpoint hit');
