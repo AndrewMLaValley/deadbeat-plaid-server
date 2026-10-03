@@ -1,16 +1,17 @@
 {
-     "name": "deadbeat-plaid-server",
-     "version": "1.0.0",
-     "main": "server.js",
-     "license": "MIT",
-     "scripts": {
-       "start": "node server.js"
-     },
-     "dependencies": {
-       "cors": "^2.8.5",
-       "dotenv": "^16.4.5",
-       "express": "^4.19.2",
-       "pg": "^8.11.5",
-       "plaid": "^20.0.0"
-     }
-   }
+  "name": "deadbeat-plaid-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.5",
+    "plaid": "^20.0.0",
+    "resend": "^4.0.0"
+  }
+}
