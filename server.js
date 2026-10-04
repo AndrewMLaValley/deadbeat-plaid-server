@@ -546,6 +546,502 @@ app.post('/unlink-account', async (req, res) => {
     client.release();
   }
 });
+function getTimeZoneParts(date, timezone) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone || "UTC",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+
+  const parts = formatter.formatToParts(date);
+
+  const values = {};
+
+  parts.forEach(part => {
+    if (part.type !== "literal") {
+      values[part.type] = part.value;
+    }
+  });
+
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+  };
+}
+
+function shiftCalendarDate(dateParts, daysToShift) {
+  const date = new Date(
+    Date.UTC(
+      dateParts.year,
+      dateParts.month - 1,
+      dateParts.day + daysToShift
+    )
+  );
+
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+  };
+}
+
+function getDaysInMonth(year, month) {
+  return new Date(
+    Date.UTC(year, month, 0)
+  ).getUTCDate();
+}
+
+function formatDateKey(dateParts) {
+  return [
+    String(dateParts.year).padStart(4, "0"),
+    String(dateParts.month).padStart(2, "0"),
+    String(dateParts.day).padStart(2, "0"),
+  ].join("-");
+}
+
+function compareCalendarDates(left, right) {
+  const leftKey = formatDateKey(left);
+  const rightKey = formatDateKey(right);
+
+  if (leftKey < rightKey) return -1;
+  if (leftKey > rightKey) return 1;
+
+  return 0;
+}
+
+function formatAlertDate(dateParts) {
+  const date = new Date(
+    Date.UTC(
+      dateParts.year,
+      dateParts.month - 1,
+      dateParts.day
+    )
+  );
+
+  return date.toLocaleDateString("en-US", {
+    timeZone: "UTC",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function formatEmailMoney(value) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(Number(value || 0));
+}
+
+function getPaymentCycleDates(localNow, dueDay) {
+  const safeDueDay = Math.min(
+    Math.max(Number(dueDay || 1), 1),
+    getDaysInMonth(localNow.year, localNow.month)
+  );
+
+  const dueDate = {
+    year: localNow.year,
+    month: localNow.month,
+    day: safeDueDay,
+  };
+
+  const previousDueDate = shiftCalendarDate(
+    dueDate,
+    -Math.max(
+      28,
+      getDaysInMonth(
+        dueDate.month === 1
+          ? dueDate.year - 1
+          : dueDate.year,
+        dueDate.month === 1
+          ? 12
+          : dueDate.month - 1
+      )
+    )
+  );
+
+  const trackerDeadline = shiftCalendarDate(
+    dueDate,
+    -3
+  );
+
+  const finalReminderDate = shiftCalendarDate(
+    dueDate,
+    -1
+  );
+
+  return {
+    dueDate,
+    previousDueDate,
+    trackerDeadline,
+    finalReminderDate,
+  };
+}
+
+async function writeNotificationLog({
+  trackerId,
+  cardId,
+  userId,
+  dueDate,
+  alertType,
+  amountDue,
+  recipientEmail,
+  deliveryStatus,
+  providerMessageId = null,
+  errorMessage = null,
+}) {
+  await pool.query(
+    `
+    insert into public.minimum_payment_notifications (
+      tracker_id,
+      card_id,
+      user_id,
+      due_date,
+      alert_type,
+      amount_due,
+      recipient_email,
+      sent_at,
+      delivery_status,
+      provider_message_id,
+      error_message
+    )
+    values (
+      $1, $2, $3, $4, $5, $6, $7,
+      case when $8 = 'sent' then now() else null end,
+      $8, $9, $10
+    )
+    on conflict (
+      tracker_id,
+      card_id,
+      user_id,
+      due_date,
+      alert_type
+    )
+    do update set
+      amount_due = excluded.amount_due,
+      recipient_email = excluded.recipient_email,
+      sent_at = case
+        when excluded.delivery_status = 'sent'
+        then now()
+        else public.minimum_payment_notifications.sent_at
+      end,
+      delivery_status = excluded.delivery_status,
+      provider_message_id = excluded.provider_message_id,
+      error_message = excluded.error_message
+    `,
+    [
+      trackerId,
+      cardId,
+      userId,
+      dueDate,
+      alertType,
+      amountDue,
+      recipientEmail,
+      deliveryStatus,
+      providerMessageId,
+      errorMessage,
+    ]
+  );
+}
+
+// Protected notification-processing route.
+// This will be called later by a Render Cron Job.
+app.post('/run-minimum-payment-notifications', async (req, res) => {
+  const jobSecret =
+    req.headers['x-notification-job-secret'];
+
+  if (
+    !jobSecret ||
+    jobSecret !== process.env.NOTIFICATION_JOB_SECRET
+  ) {
+    return res.status(401).json({
+      error: 'Unauthorized notification job request',
+    });
+  }
+
+  if (
+    !process.env.RESEND_API_KEY ||
+    !process.env.RESEND_FROM_EMAIL
+  ) {
+    return res.status(500).json({
+      error: 'Resend notification configuration is incomplete',
+    });
+  }
+
+  const now = new Date();
+
+  const summary = {
+    processed: 0,
+    sent: 0,
+    skipped: 0,
+    failed: 0,
+    details: [],
+  };
+
+  try {
+    const { rows: preferences } = await pool.query(
+      `
+      select
+        np.tracker_id,
+        np.user_id,
+        np.email_address,
+        np.timezone,
+        c.id as card_id,
+        c.name as card_name,
+        c.minimum_payment,
+        c.due_day
+      from public.notification_preferences np
+      join public.cards c
+        on c.tracker_id = np.tracker_id
+      where np.email_enabled = true
+        and c.minimum_payment > 0
+        and c.due_day is not null
+      `
+    );
+
+    for (const preference of preferences) {
+      summary.processed += 1;
+
+      const timezone =
+        preference.timezone || "UTC";
+
+      const localNow = getTimeZoneParts(
+        now,
+        timezone
+      );
+
+      const cycle = getPaymentCycleDates(
+        localNow,
+        preference.due_day
+      );
+
+      const dueDateKey = formatDateKey(
+        cycle.dueDate
+      );
+
+      const previousDueDateKey = formatDateKey(
+        cycle.previousDueDate
+      );
+
+      const { rows: paymentRows } = await pool.query(
+        `
+        select amount
+        from public.entries
+        where tracker_id = $1
+          and card_id = $2
+          and entry_type = 'payment'
+          and entry_date >= $3
+          and entry_date <= $4
+        `,
+        [
+          preference.tracker_id,
+          preference.card_id,
+          previousDueDateKey,
+          dueDateKey,
+        ]
+      );
+
+      const paymentsRecorded = paymentRows.reduce(
+        (sum, row) => sum + Number(row.amount || 0),
+        0
+      );
+
+      const amountDue = Math.max(
+        0,
+        Number(preference.minimum_payment || 0) -
+        paymentsRecorded
+      );
+
+      if (amountDue <= 0) {
+        summary.skipped += 1;
+        continue;
+      }
+
+      const localDate = {
+        year: localNow.year,
+        month: localNow.month,
+        day: localNow.day,
+      };
+
+      const redConditionReached =
+        compareCalendarDates(
+          localDate,
+          cycle.trackerDeadline
+        ) >= 0;
+
+      const finalReminderWindow =
+        compareCalendarDates(
+          localDate,
+          cycle.finalReminderDate
+        ) === 0 &&
+        localNow.hour === 8 &&
+        localNow.minute < 30;
+
+      let alertType = null;
+      let subject = null;
+      let heading = null;
+      let message = null;
+
+      if (redConditionReached) {
+        alertType = 'red_condition';
+
+        subject =
+          `Payment Required — ${preference.card_name}`;
+
+        heading =
+          'Minimum Payment Required';
+
+        message =
+          `A minimum payment of ${formatEmailMoney(amountDue)} ` +
+          `is required by ${formatAlertDate(cycle.trackerDeadline)}.`;
+      }
+
+      if (finalReminderWindow) {
+        alertType = 'final_8am_reminder';
+
+        subject =
+          `Final Payment Reminder — ${preference.card_name}`;
+
+        heading =
+          'Payment Due Tomorrow';
+
+        message =
+          `A minimum payment of ${formatEmailMoney(amountDue)} ` +
+          `remains due before the card due date of ` +
+          `${formatAlertDate(cycle.dueDate)}.`;
+      }
+
+      if (!alertType) {
+        summary.skipped += 1;
+        continue;
+      }
+
+      const { rows: existingNotifications } =
+        await pool.query(
+          `
+          select id, delivery_status
+          from public.minimum_payment_notifications
+          where tracker_id = $1
+            and card_id = $2
+            and user_id = $3
+            and due_date = $4
+            and alert_type = $5
+          limit 1
+          `,
+          [
+            preference.tracker_id,
+            preference.card_id,
+            preference.user_id,
+            dueDateKey,
+            alertType,
+          ]
+        );
+
+      if (
+        existingNotifications.length &&
+        existingNotifications[0].delivery_status === 'sent'
+      ) {
+        summary.skipped += 1;
+        continue;
+      }
+
+      try {
+        const { data, error } = await resend.emails.send({
+          from: process.env.RESEND_FROM_EMAIL,
+          to: [preference.email_address],
+          subject,
+          html: `
+            <h2>${heading}</h2>
+            <p>${message}</p>
+            <p><b>Card:</b> ${preference.card_name}</p>
+            <p><b>Actual Due Date:</b>
+              ${formatAlertDate(cycle.dueDate)}
+            </p>
+            <p>
+              Please verify the payment amount and due date
+              against the card issuer statement.
+            </p>
+          `,
+        });
+
+        if (error) {
+          throw new Error(
+            error.message ||
+            'Resend did not send the notification'
+          );
+        }
+
+        await writeNotificationLog({
+          trackerId: preference.tracker_id,
+          cardId: preference.card_id,
+          userId: preference.user_id,
+          dueDate: dueDateKey,
+          alertType,
+          amountDue,
+          recipientEmail: preference.email_address,
+          deliveryStatus: 'sent',
+          providerMessageId: data?.id || null,
+        });
+
+        summary.sent += 1;
+
+        summary.details.push({
+          card: preference.card_name,
+          alert_type: alertType,
+          status: 'sent',
+        });
+
+      } catch (emailError) {
+        await writeNotificationLog({
+          trackerId: preference.tracker_id,
+          cardId: preference.card_id,
+          userId: preference.user_id,
+          dueDate: dueDateKey,
+          alertType,
+          amountDue,
+          recipientEmail: preference.email_address,
+          deliveryStatus: 'failed',
+          errorMessage:
+            emailError.message || String(emailError),
+        });
+
+        summary.failed += 1;
+
+        summary.details.push({
+          card: preference.card_name,
+          alert_type: alertType,
+          status: 'failed',
+          error:
+            emailError.message || String(emailError),
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      summary,
+    });
+
+  } catch (error) {
+    console.error(
+      'run-minimum-payment-notifications error:',
+      error
+    );
+
+    return res.status(500).json({
+      error:
+        'Failed to process minimum-payment notifications',
+      details: error.message || String(error),
+    });
+  }
+});
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
