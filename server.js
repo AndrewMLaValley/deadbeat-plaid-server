@@ -20,6 +20,113 @@ const pool = new Pool({
 const resend = new Resend(
   process.env.RESEND_API_KEY
 );
+async function requireVerifiedTrackerMember(
+  req,
+  res,
+  next
+) {
+  try {
+    const authHeader =
+      req.headers.authorization || "";
+
+    const accessToken = authHeader
+      .replace(/^Bearer\s+/i, "")
+      .trim();
+
+    if (!accessToken) {
+      return res.status(401).json({
+        error: "Missing authorization token",
+      });
+    }
+
+    const trackerId =
+      req.body?.tracker_id ||
+      req.query?.tracker_id ||
+      "";
+
+    if (!trackerId) {
+      return res.status(400).json({
+        error: "tracker_id is required",
+      });
+    }
+
+    if (
+      !process.env.SUPABASE_URL ||
+      !process.env.SUPABASE_PUBLISHABLE_KEY
+    ) {
+      return res.status(500).json({
+        error:
+          "Supabase authentication is not configured " +
+          "on the backend.",
+      });
+    }
+
+    const userResponse = await fetch(
+      `${process.env.SUPABASE_URL}/auth/v1/user`,
+      {
+        method: "GET",
+        headers: {
+          "apikey":
+            process.env.SUPABASE_PUBLISHABLE_KEY,
+          "Authorization":
+            `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (!userResponse.ok) {
+      return res.status(401).json({
+        error: "Invalid or expired authorization token",
+      });
+    }
+
+    const user = await userResponse.json();
+
+    if (!user?.id) {
+      return res.status(401).json({
+        error:
+          "Authenticated user information was not returned.",
+      });
+    }
+
+    const membershipResult = await pool.query(
+      `
+      select 1
+      from public.tracker_members
+      where tracker_id = $1
+        and user_id = $2
+      limit 1
+      `,
+      [
+        trackerId,
+        user.id,
+      ]
+    );
+
+    if (!membershipResult.rows.length) {
+      return res.status(403).json({
+        error:
+          "You do not have access to this tracker.",
+      });
+    }
+
+    req.authenticatedUserId = user.id;
+    req.authenticatedTrackerId = trackerId;
+
+    next();
+
+  } catch (error) {
+    console.error(
+      "Tracker authorization middleware error:",
+      error
+    );
+
+    return res.status(500).json({
+      error:
+        "Unable to verify tracker authorization.",
+    });
+  }
+}
 // Health check
 app.get('/', (req, res) => {
   res.json({ ok: true });
@@ -126,7 +233,10 @@ app.get('/trace', (req, res) => {
 });
 
 // Map a credit card to a linked bank account
-app.post('/card-plaid-mapping', async (req, res) => {
+app.post(
+  '/card-plaid-mapping',
+  requireVerifiedTrackerMember,
+  async (req, res) => {
   console.log('CARD-PLAID-MAPPING endpoint hit');
 
   const authHeader = req.headers.authorization || '';
@@ -177,7 +287,10 @@ app.post('/card-plaid-mapping', async (req, res) => {
 });
 
 // Get card → linked account mappings for a tracker
-app.get('/card-plaid-mappings', async (req, res) => {
+app.get(
+  '/card-plaid-mappings',
+  requireVerifiedTrackerMember,
+  async (req, res) => {
   console.log('CARD-PLAID-MAPPINGS endpoint hit');
 
   const authHeader = req.headers.authorization || '';
@@ -225,7 +338,10 @@ app.get('/card-plaid-mappings', async (req, res) => {
 });
 
 // Create a Plaid Link token
-app.post('/create-link-token', async (req, res) => {
+app.post(
+  '/create-link-token',
+  requireVerifiedTrackerMember,
+  async (req, res) => {
   console.log('CREATE-LINK-TOKEN endpoint hit');
 
   try {
@@ -270,7 +386,10 @@ app.post('/create-link-token', async (req, res) => {
 });
 
 // Exchange public_token and store accounts
-app.post('/exchange-public-token', async (req, res) => {
+app.post(
+  '/exchange-public-token',
+  requireVerifiedTrackerMember,
+  async (req, res) => {
   console.log('EXCHANGE-PUBLIC-TOKEN endpoint hit');
 
   const authHeader = req.headers.authorization || '';
@@ -385,7 +504,10 @@ app.post('/exchange-public-token', async (req, res) => {
 });
 
 // Get linked accounts for a tracker
-app.get('/linked-accounts', async (req, res) => {
+app.get(
+  '/linked-accounts',
+  requireVerifiedTrackerMember,
+  async (req, res) => {
   console.log('LINKED-ACCOUNTS endpoint hit');
 
   const authHeader = req.headers.authorization || '';
@@ -436,7 +558,10 @@ app.get('/linked-accounts', async (req, res) => {
   }
 });
 // Unlink one linked Plaid account from a tracker
-app.post('/unlink-account', async (req, res) => {
+app.post(
+  '/unlink-account',
+  requireVerifiedTrackerMember,
+  async (req, res) => {
   console.log('UNLINK-ACCOUNT endpoint hit');
 
   const authHeader = req.headers.authorization || '';
