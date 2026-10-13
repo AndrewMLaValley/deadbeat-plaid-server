@@ -1825,7 +1825,7 @@ app.post(
       items_processed: 0,
       items_failed: 0,
       item_results: [],
-      matches: null
+      matches: null,
     late_fees: null,
       };
 
