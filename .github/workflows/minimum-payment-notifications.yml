@@ -1,0 +1,25 @@
+name: Minimum Payment Email Alerts
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 * * * *"
+
+permissions: {}
+
+jobs:
+  send-minimum-payment-alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Run protected minimum-payment notification job
+        env:
+          BACKEND_URL: ${{ secrets.RECURRING_TRANSFER_SERVICE_URL }}
+          NOTIFICATION_JOB_SECRET: ${{ secrets.NOTIFICATION_JOB_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "x-notification-job-secret: ${NOTIFICATION_JOB_SECRET}" \
+            "${BACKEND_URL}/run-minimum-payment-notifications"
