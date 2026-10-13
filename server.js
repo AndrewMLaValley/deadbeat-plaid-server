@@ -1042,6 +1042,557 @@ app.post('/run-minimum-payment-notifications', async (req, res) => {
     });
   }
 });
+// ============================================================
+// BACKEND BUILD 1.1 — PLAID TRANSACTION SYNC AND RECURRING
+// TRANSFER BANK MATCHING
+// ============================================================
+
+function utcDateKey(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function currentUtcCompletionMonth() {
+  return `${utcDateKey(new Date()).slice(0, 7)}-01`;
+}
+
+function scheduledDateForCurrentMonth(chargeDay) {
+  const now = new Date();
+
+  const year = now.getUTCFullYear();
+  const monthIndex = now.getUTCMonth();
+
+  const lastDayOfMonth = new Date(
+    Date.UTC(year, monthIndex + 1, 0)
+  ).getUTCDate();
+
+  const safeDay = Math.min(
+    Math.max(Number(chargeDay || 1), 1),
+    lastDayOfMonth
+  );
+
+  return new Date(
+    Date.UTC(year, monthIndex, safeDay)
+  );
+}
+
+function addUtcDays(date, days) {
+  const nextDate = new Date(date.getTime());
+
+  nextDate.setUTCDate(
+    nextDate.getUTCDate() + days
+  );
+
+  return nextDate;
+}
+
+async function storePlaidTransaction(
+  trackerId,
+  plaidItemId,
+  transaction
+) {
+  await pool.query(
+    `
+    insert into public.plaid_transactions (
+      tracker_id,
+      plaid_item_id,
+      plaid_account_id,
+      plaid_transaction_id,
+      pending_transaction_id,
+      transaction_date,
+      authorized_date,
+      name,
+      merchant_name,
+      amount,
+      iso_currency_code,
+      pending,
+      raw_transaction,
+      updated_at
+    )
+    values (
+      $1, $2, $3, $4, $5, $6, $7, $8, $9,
+      $10, $11, $12, $13::jsonb, now()
+    )
+    on conflict (plaid_transaction_id)
+    do update set
+      tracker_id = excluded.tracker_id,
+      plaid_item_id = excluded.plaid_item_id,
+      plaid_account_id = excluded.plaid_account_id,
+      pending_transaction_id =
+        excluded.pending_transaction_id,
+      transaction_date = excluded.transaction_date,
+      authorized_date = excluded.authorized_date,
+      name = excluded.name,
+      merchant_name = excluded.merchant_name,
+      amount = excluded.amount,
+      iso_currency_code = excluded.iso_currency_code,
+      pending = excluded.pending,
+      raw_transaction = excluded.raw_transaction,
+      updated_at = now()
+    `,
+    [
+      trackerId,
+      plaidItemId,
+      transaction.account_id,
+      transaction.transaction_id,
+      transaction.pending_transaction_id || null,
+      transaction.date || null,
+      transaction.authorized_date || null,
+      transaction.name || null,
+      transaction.merchant_name || null,
+      Number(transaction.amount || 0),
+      transaction.iso_currency_code || null,
+      transaction.pending === true,
+      JSON.stringify(transaction),
+    ]
+  );
+}
+
+async function removePlaidTransaction(
+  plaidTransactionId
+) {
+  if (!plaidTransactionId) return;
+
+  await pool.query(
+    `
+    delete from public.plaid_transactions
+    where plaid_transaction_id = $1
+    `,
+    [plaidTransactionId]
+  );
+}
+
+async function syncPlaidItemTransactions(item) {
+  let cursor = item.transactions_cursor || null;
+  let hasMore = true;
+
+  let pagesProcessed = 0;
+  let addedCount = 0;
+  let modifiedCount = 0;
+  let removedCount = 0;
+
+  while (hasMore) {
+    const request = {
+      access_token: item.access_token,
+    };
+
+    if (cursor) {
+      request.cursor = cursor;
+    }
+
+    const response =
+      await plaidClient.transactionsSync(request);
+
+    const data = response.data;
+
+    const added = data.added || [];
+    const modified = data.modified || [];
+    const removed = data.removed || [];
+
+    for (const transaction of added) {
+      await storePlaidTransaction(
+        item.tracker_id,
+        item.plaid_item_id,
+        transaction
+      );
+
+      addedCount += 1;
+    }
+
+    for (const transaction of modified) {
+      await storePlaidTransaction(
+        item.tracker_id,
+        item.plaid_item_id,
+        transaction
+      );
+
+      modifiedCount += 1;
+    }
+
+    for (const removedTransaction of removed) {
+      await removePlaidTransaction(
+        removedTransaction.transaction_id
+      );
+
+      removedCount += 1;
+    }
+
+    cursor = data.next_cursor;
+    hasMore = data.has_more === true;
+    pagesProcessed += 1;
+  }
+
+  await pool.query(
+    `
+    update public.plaid_items
+    set
+      transactions_cursor = $2,
+      transactions_sync_initialized_at =
+        coalesce(
+          transactions_sync_initialized_at,
+          now()
+        ),
+      transactions_last_synced_at = now(),
+      transactions_sync_error = null
+    where plaid_item_id = $1
+    `,
+    [
+      item.plaid_item_id,
+      cursor,
+    ]
+  );
+
+  return {
+    pages_processed: pagesProcessed,
+    added: addedCount,
+    modified: modifiedCount,
+    removed: removedCount,
+  };
+}
+
+async function recordPlaidSyncFailure(
+  plaidItemId,
+  error
+) {
+  await pool.query(
+    `
+    update public.plaid_items
+    set transactions_sync_error = $2
+    where plaid_item_id = $1
+    `,
+    [
+      plaidItemId,
+      error?.message || String(error),
+    ]
+  );
+}
+
+async function matchRecurringTransfersFromBank() {
+  const today = new Date();
+
+  const todayKey = utcDateKey(today);
+
+  const completionMonth =
+    currentUtcCompletionMonth();
+
+  /*
+    A bank-linked recurring transfer is eligible only when:
+    - it is active;
+    - bank matching is explicitly enabled;
+    - it is mapped to a locally saved Plaid-backed bank account;
+    - it has not already been completed this calendar month.
+  */
+  const { rows: recurringTransfers } =
+    await pool.query(
+      `
+      select
+        recurring.id as recurring_charge_id,
+        recurring.tracker_id,
+        recurring.card_id,
+        recurring.amount as recurring_amount,
+        recurring.charge_day,
+        recurring.bank_match_description,
+
+        linked.plaid_account_id
+
+      from public.card_recurring_charges as recurring
+
+      join public.bank_accounts as bank
+        on bank.id = recurring.bank_account_id
+
+      join public.linked_accounts as linked
+        on linked.id::text =
+          bank.plaid_linked_account_id
+
+      left join public.recurring_transfer_completions
+        as completion
+        on completion.recurring_charge_id =
+             recurring.id
+        and completion.completion_month = $1
+
+      where recurring.active is distinct from false
+        and recurring.bank_match_enabled = true
+        and recurring.bank_account_id is not null
+        and completion.id is null
+      `,
+      [completionMonth]
+    );
+
+  const summary = {
+    eligible: recurringTransfers.length,
+    matched: 0,
+    skipped_not_due: 0,
+    skipped_outside_window: 0,
+    skipped_ambiguous: 0,
+    skipped_no_match: 0,
+    errors: [],
+  };
+
+  for (const recurring of recurringTransfers) {
+    try {
+      const scheduledDate =
+        scheduledDateForCurrentMonth(
+          recurring.charge_day
+        );
+
+      const scheduledDateKey =
+        utcDateKey(scheduledDate);
+
+      /*
+        Do not evaluate a transfer until the day after its
+        scheduled date. This matches the app's green-to-amber
+        behavior.
+      */
+      if (todayKey <= scheduledDateKey) {
+        summary.skipped_not_due += 1;
+        continue;
+      }
+
+      /*
+        To avoid incorrectly confirming an older unrelated
+        transaction, consider only the scheduled date through
+        five days afterward.
+      */
+      const latestMatchDate = addUtcDays(
+        scheduledDate,
+        5
+      );
+
+      const latestMatchDateKey = utcDateKey(
+        latestMatchDate
+      );
+
+      if (todayKey > latestMatchDateKey) {
+        summary.skipped_outside_window += 1;
+        continue;
+      }
+
+      const description = String(
+        recurring.bank_match_description || ""
+      ).trim();
+
+      /*
+        A high-confidence candidate must:
+        - come from the selected Plaid account;
+        - be posted, not pending;
+        - fall in the allowed date window;
+        - match the amount to the cent;
+        - match optional description text, if supplied.
+      */
+      const { rows: candidates } =
+        await pool.query(
+          `
+          select
+            plaid_transaction_id,
+            transaction_date,
+            name,
+            merchant_name,
+            amount
+          from public.plaid_transactions
+          where tracker_id = $1
+            and plaid_account_id = $2
+            and pending = false
+            and transaction_date >= $3
+            and transaction_date <= $4
+            and abs(abs(amount) - $5) < 0.01
+            and (
+              $6 = ''
+              or coalesce(name, '') ilike
+                '%' || $6 || '%'
+              or coalesce(merchant_name, '') ilike
+                '%' || $6 || '%'
+            )
+          order by transaction_date asc
+          limit 2
+          `,
+          [
+            recurring.tracker_id,
+            recurring.plaid_account_id,
+            scheduledDateKey,
+            latestMatchDateKey,
+            Number(recurring.recurring_amount || 0),
+            description,
+          ]
+        );
+
+      if (!candidates.length) {
+        summary.skipped_no_match += 1;
+        continue;
+      }
+
+      /*
+        More than one matching transaction means the match is
+        uncertain. Leave the item amber for manual confirmation.
+      */
+      if (candidates.length !== 1) {
+        summary.skipped_ambiguous += 1;
+        continue;
+      }
+
+      const candidate = candidates[0];
+
+      const insertResult = await pool.query(
+        `
+        insert into public.recurring_transfer_completions (
+          tracker_id,
+          card_id,
+          recurring_charge_id,
+          completion_month,
+          completed_on,
+          confirmation_source,
+          bank_transaction_id
+        )
+        values ($1, $2, $3, $4, $5, 'bank', $6)
+        on conflict (
+          recurring_charge_id,
+          completion_month
+        )
+        do nothing
+        `,
+        [
+          recurring.tracker_id,
+          recurring.card_id,
+          recurring.recurring_charge_id,
+          completionMonth,
+          candidate.transaction_date,
+          candidate.plaid_transaction_id,
+        ]
+      );
+
+      if (insertResult.rowCount === 1) {
+        summary.matched += 1;
+
+        console.log(
+          "Recurring transfer bank-confirmed:",
+          {
+            recurring_charge_id:
+              recurring.recurring_charge_id,
+            plaid_transaction_id:
+              candidate.plaid_transaction_id,
+          }
+        );
+      }
+
+    } catch (error) {
+      console.error(
+        "Recurring transfer match error:",
+        error
+      );
+
+      summary.errors.push(
+        error?.message || String(error)
+      );
+    }
+  }
+
+  return summary;
+}
+
+/*
+  Protected daily job.
+
+  It intentionally accepts no tracker ID from a browser or user.
+  The job syncs server-stored Plaid Items, then performs only
+  high-confidence recurring-transfer matches.
+*/
+app.post(
+  "/run-recurring-transfer-bank-match",
+  async (req, res) => {
+    const jobSecret =
+      req.headers[
+        "x-recurring-transfer-job-secret"
+      ];
+
+    if (
+      !jobSecret ||
+      jobSecret !==
+        process.env.RECURRING_TRANSFER_JOB_SECRET
+    ) {
+      return res.status(401).json({
+        error:
+          "Unauthorized recurring-transfer job request",
+      });
+    }
+
+    const summary = {
+      items_processed: 0,
+      items_failed: 0,
+      item_results: [],
+      matches: null,
+    };
+
+    try {
+      const { rows: plaidItems } =
+        await pool.query(
+          `
+          select
+            tracker_id,
+            plaid_item_id,
+            access_token,
+            transactions_cursor
+          from public.plaid_items
+          order by created_at asc
+          `
+        );
+
+      for (const item of plaidItems) {
+        try {
+          const itemResult =
+            await syncPlaidItemTransactions(item);
+
+          summary.items_processed += 1;
+
+          summary.item_results.push({
+            plaid_item_id: item.plaid_item_id,
+            status: "synced",
+            ...itemResult,
+          });
+
+        } catch (error) {
+          summary.items_failed += 1;
+
+          await recordPlaidSyncFailure(
+            item.plaid_item_id,
+            error
+          );
+
+          summary.item_results.push({
+            plaid_item_id: item.plaid_item_id,
+            status: "failed",
+            error:
+              error?.message || String(error),
+          });
+
+          console.error(
+            "Plaid transaction sync failed:",
+            item.plaid_item_id,
+            error
+          );
+        }
+      }
+
+      summary.matches =
+        await matchRecurringTransfersFromBank();
+
+      return res.json({
+        success: true,
+        summary,
+      });
+
+    } catch (error) {
+      console.error(
+        "run-recurring-transfer-bank-match error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to run recurring-transfer bank match",
+        details:
+          error?.message || String(error),
+      });
+    }
+  }
+);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
