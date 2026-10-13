@@ -988,7 +988,37 @@ app.post('/run-minimum-payment-notifications', async (req, res) => {
         summary.skipped += 1;
         continue;
       }
+const { rows: canceledLateFeeRows } =
+  await pool.query(
+    `
+    select id
+    from public.entries
+    where tracker_id = $1
+      and card_id = $2
+      and is_auto_late_fee = true
+      and late_fee_due_date = $3
+      and late_fee_canceled = true
+    limit 1
+    `,
+    [
+      preference.tracker_id,
+      preference.card_id,
+      dueDateKey,
+    ]
+  );
 
+if (canceledLateFeeRows.length) {
+  summary.skipped += 1;
+
+  summary.details.push({
+    card: preference.card_name,
+    status: "skipped",
+    reason:
+      "Late fee canceled for this payment cycle",
+  });
+
+  continue;
+}
       const localDate = {
         year: localNow.year,
         month: localNow.month,
