@@ -1393,7 +1393,8 @@ async function matchRecurringTransfersFromBank() {
             and pending = false
             and transaction_date >= $3
             and transaction_date <= $4
-            and abs(abs(amount) - $5) < 0.01
+           and amount > 0
+and abs(amount - $5) < 0.01
             and (
               $6 = ''
               or coalesce(name, '') ilike
