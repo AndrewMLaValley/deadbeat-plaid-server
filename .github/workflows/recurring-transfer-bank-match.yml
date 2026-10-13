@@ -1,0 +1,25 @@
+name: Daily Recurring Transfer Bank Match
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "30 12 * * *"
+
+permissions: {}
+
+jobs:
+  sync-and-match:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Run protected recurring-transfer match job
+        env:
+          RECURRING_TRANSFER_SERVICE_URL: ${{ secrets.RECURRING_TRANSFER_SERVICE_URL }}
+          RECURRING_TRANSFER_JOB_SECRET: ${{ secrets.RECURRING_TRANSFER_JOB_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "x-recurring-transfer-job-secret: ${RECURRING_TRANSFER_JOB_SECRET}" \
+            "${RECURRING_TRANSFER_SERVICE_URL}/run-recurring-transfer-bank-match"
