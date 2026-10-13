@@ -1487,7 +1487,314 @@ and abs(amount - $5) < 0.01
 
   return summary;
 }
+// ============================================================
+// BACKEND BUILD 1.2 — AUTOMATIC LATE-FEE EVALUATION
+// ============================================================
 
+function currentUtcDateParts() {
+  const now = new Date();
+
+  return {
+    year: now.getUTCFullYear(),
+    month: now.getUTCMonth() + 1,
+    day: now.getUTCDate(),
+  };
+}
+
+async function evaluateAutomaticLateFees() {
+  const today = currentUtcDateParts();
+
+  const automaticFeesEnabled =
+    process.env.AUTO_LATE_FEES_ENABLED === "true";
+
+  const summary = {
+    enabled: automaticFeesEnabled,
+    cards_reviewed: 0,
+    eligible: 0,
+    created: 0,
+    skipped_not_overdue: 0,
+    skipped_no_balance: 0,
+    skipped_minimum_covered: 0,
+    skipped_fee_canceled: 0,
+    skipped_fee_exists: 0,
+    errors: [],
+    candidates: [],
+  };
+
+  const { rows: cards } = await pool.query(
+    `
+    select
+      card.id,
+      card.tracker_id,
+      card.name,
+      card.minimum_payment,
+      card.due_day,
+      card.late_fee_amount,
+      card.starting_balance,
+
+      tracker.owner_id as created_by,
+
+      greatest(
+        0,
+        coalesce(card.starting_balance, 0) +
+        coalesce(
+          sum(
+            case
+              when entry.entry_type = 'expense'
+                and not (
+                  coalesce(
+                    entry.is_auto_late_fee,
+                    false
+                  )
+                  and coalesce(
+                    entry.late_fee_canceled,
+                    false
+                  )
+                )
+              then coalesce(entry.amount, 0)
+
+              when entry.entry_type = 'payment'
+              then -coalesce(entry.amount, 0)
+
+              else 0
+            end
+          ),
+          0
+        )
+      ) as current_balance
+
+    from public.cards as card
+
+    join public.trackers as tracker
+      on tracker.id = card.tracker_id
+
+    left join public.entries as entry
+      on entry.card_id = card.id
+
+    where coalesce(card.minimum_payment, 0) > 0
+      and card.due_day is not null
+      and coalesce(card.late_fee_amount, 0) > 0
+
+    group by
+      card.id,
+      tracker.owner_id
+    `
+  );
+
+  for (const card of cards) {
+    try {
+      summary.cards_reviewed += 1;
+
+      const currentBalance =
+        Number(card.current_balance || 0);
+
+      if (currentBalance <= 0) {
+        summary.skipped_no_balance += 1;
+        continue;
+      }
+
+      const cycle = getPaymentCycleDates(
+        today,
+        card.due_day
+      );
+
+      const dueDateKey = formatDateKey(
+        cycle.dueDate
+      );
+
+      /*
+        A late fee becomes eligible only on the calendar day
+        after the card's actual due date.
+      */
+      if (
+        compareCalendarDates(
+          today,
+          cycle.dueDate
+        ) <= 0
+      ) {
+        summary.skipped_not_overdue += 1;
+        continue;
+      }
+
+      const previousDueDateKey = formatDateKey(
+        cycle.previousDueDate
+      );
+
+      const { rows: paymentRows } =
+        await pool.query(
+          `
+          select amount
+          from public.entries
+          where tracker_id = $1
+            and card_id = $2
+            and entry_type = 'payment'
+            and entry_date >= $3
+            and entry_date <= $4
+          `,
+          [
+            card.tracker_id,
+            card.id,
+            previousDueDateKey,
+            dueDateKey,
+          ]
+        );
+
+      const paymentsRecorded = paymentRows.reduce(
+        (sum, payment) =>
+          sum + Number(payment.amount || 0),
+        0
+      );
+
+      const minimumPayment =
+        Number(card.minimum_payment || 0);
+
+      const shortfall = Math.max(
+        0,
+        minimumPayment - paymentsRecorded
+      );
+
+      if (shortfall <= 0) {
+        summary.skipped_minimum_covered += 1;
+        continue;
+      }
+
+      /*
+        A canceled late fee remains the permanent override for
+        this specific card and due-date cycle.
+      */
+      const { rows: canceledFeeRows } =
+        await pool.query(
+          `
+          select id
+          from public.entries
+          where card_id = $1
+            and is_auto_late_fee = true
+            and late_fee_due_date = $2
+            and late_fee_canceled = true
+          limit 1
+          `,
+          [
+            card.id,
+            dueDateKey,
+          ]
+        );
+
+      if (canceledFeeRows.length) {
+        summary.skipped_fee_canceled += 1;
+        continue;
+      }
+
+      const { rows: existingFeeRows } =
+        await pool.query(
+          `
+          select id
+          from public.entries
+          where card_id = $1
+            and is_auto_late_fee = true
+            and late_fee_due_date = $2
+          limit 1
+          `,
+          [
+            card.id,
+            dueDateKey,
+          ]
+        );
+
+      if (existingFeeRows.length) {
+        summary.skipped_fee_exists += 1;
+        continue;
+      }
+
+      summary.eligible += 1;
+
+      const feeDateKey = formatDateKey(
+        shiftCalendarDate(
+          cycle.dueDate,
+          1
+        )
+      );
+
+      const candidate = {
+        card_name: card.name,
+        fee_amount:
+          Number(card.late_fee_amount || 0),
+        payment_shortfall: shortfall,
+        actual_due_date: dueDateKey,
+        fee_date: feeDateKey,
+      };
+
+      summary.candidates.push(candidate);
+
+      /*
+        Dry-run mode is the default. No fee is created unless
+        AUTO_LATE_FEES_ENABLED is explicitly set to true.
+      */
+      if (!automaticFeesEnabled) {
+        continue;
+      }
+
+      const { rowCount } = await pool.query(
+        `
+        insert into public.entries (
+          tracker_id,
+          card_id,
+          created_by,
+          entry_type,
+          merchant,
+          amount,
+          entry_date,
+          category,
+          notes,
+          cash_moved,
+          is_auto_late_fee,
+          late_fee_due_date,
+          late_fee_canceled
+        )
+        values (
+          $1, $2, $3,
+          'expense',
+          $4, $5, $6,
+          'Fees',
+          $7,
+          false,
+          true,
+          $8,
+          false
+        )
+        on conflict do nothing
+        `,
+        [
+          card.tracker_id,
+          card.id,
+          card.created_by,
+          `Late Fee — ${card.name}`,
+          Number(card.late_fee_amount || 0),
+          feeDateKey,
+          `Automatically recorded after the minimum ` +
+            `payment remained unpaid for the due date ` +
+            `${dueDateKey}.`,
+          dueDateKey,
+        ]
+      );
+
+      if (rowCount === 1) {
+        summary.created += 1;
+      }
+
+    } catch (error) {
+      console.error(
+        "Automatic late-fee evaluation error:",
+        error
+      );
+
+      summary.errors.push(
+        error?.message || String(error)
+      );
+    }
+  }
+
+  return summary;
+}
 /*
   Protected daily job.
 
@@ -1518,8 +1825,9 @@ app.post(
       items_processed: 0,
       items_failed: 0,
       item_results: [],
-      matches: null,
-    };
+      matches: null
+    late_fees: null,
+      };
 
     try {
       const { rows: plaidItems } =
@@ -1573,7 +1881,8 @@ app.post(
 
       summary.matches =
         await matchRecurringTransfersFromBank();
-
+summary.late_fees =
+  await evaluateAutomaticLateFees();
       return res.json({
         success: true,
         summary,
