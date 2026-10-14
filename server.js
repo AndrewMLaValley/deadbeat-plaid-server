@@ -1112,9 +1112,9 @@ if (canceledLateFeeRows.length) {
         heading =
           'Minimum Payment Required';
 
-        message =
+                message =
           `A minimum payment of ${formatEmailMoney(amountDue)} ` +
-          `is required by ${formatAlertDate(cycle.trackerDeadline)}.`;
+          `is due by ${formatAlertDate(cycle.dueDate)}.`;
       }
 
       if (finalReminderWindow) {
@@ -1175,9 +1175,7 @@ if (canceledLateFeeRows.length) {
             <h2>${heading}</h2>
             <p>${message}</p>
             <p><b>Card:</b> ${preference.card_name}</p>
-            <p><b>Actual Due Date:</b>
-              ${formatAlertDate(cycle.dueDate)}
-            </p>
+            
             <p>
               Please verify the payment amount and due date
               against the card issuer statement.
