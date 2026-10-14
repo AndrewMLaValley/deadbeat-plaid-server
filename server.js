@@ -919,9 +919,10 @@ app.post('/run-minimum-payment-notifications', async (req, res) => {
         np.email_address,
         np.timezone,
         c.id as card_id,
-        c.name as card_name,
-        c.minimum_payment,
-        c.due_day
+c.name as card_name,
+c.minimum_payment,
+c.due_day,
+c.starting_balance
       from public.notification_preferences np
       join public.cards c
         on c.tracker_id = np.tracker_id
@@ -933,7 +934,65 @@ app.post('/run-minimum-payment-notifications', async (req, res) => {
 
     for (const preference of preferences) {
       summary.processed += 1;
+      const { rows: balanceRows } =
+        await pool.query(
+          `
+          select greatest(
+            0,
+            $3::numeric +
+            coalesce(
+              sum(
+                case
+                  when entry.entry_type = 'expense'
+                    and not (
+                      coalesce(
+                        entry.is_auto_late_fee,
+                        false
+                      )
+                      and coalesce(
+                        entry.late_fee_canceled,
+                        false
+                      )
+                    )
+                  then coalesce(entry.amount, 0)
 
+                  when entry.entry_type = 'payment'
+                  then -coalesce(entry.amount, 0)
+
+                  else 0
+                end
+              ),
+              0
+            )
+          ) as current_balance
+
+          from public.entries as entry
+
+          where entry.tracker_id = $1
+            and entry.card_id = $2
+          `,
+          [
+            preference.tracker_id,
+            preference.card_id,
+            Number(preference.starting_balance || 0),
+          ]
+        );
+
+      const currentBalance = Number(
+        balanceRows[0]?.current_balance || 0
+      );
+
+      if (currentBalance <= 0) {
+        summary.skipped += 1;
+
+        summary.details.push({
+          card: preference.card_name,
+          status: "skipped",
+          reason: "No card balance due",
+        });
+
+        continue;
+      }
       const timezone =
         preference.timezone || "UTC";
 
