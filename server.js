@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
+const crypto = require('crypto');
 const { plaidClient } = require('./plaidClient');
 
 const app = express();
@@ -20,6 +21,125 @@ const pool = new Pool({
 const resend = new Resend(
   process.env.RESEND_API_KEY
 );
+const PLAID_TOKEN_ENCRYPTION_PREFIX =
+  "enc:v1:";
+
+function getPlaidTokenEncryptionKey() {
+  const secret =
+    process.env.PLAID_TOKEN_ENCRYPTION_KEY || "";
+
+  if (secret.length < 32) {
+    throw new Error(
+      "PLAID_TOKEN_ENCRYPTION_KEY is missing or too short."
+    );
+  }
+
+  return crypto
+    .createHash("sha256")
+    .update(secret, "utf8")
+    .digest();
+}
+
+function encryptPlaidAccessToken(accessToken) {
+  const token = String(accessToken || "");
+
+  if (!token) {
+    throw new Error(
+      "Cannot encrypt an empty Plaid access token."
+    );
+  }
+
+  if (token.startsWith(
+    PLAID_TOKEN_ENCRYPTION_PREFIX
+  )) {
+    return token;
+  }
+
+  const key = getPlaidTokenEncryptionKey();
+
+  const iv = crypto.randomBytes(12);
+
+  const cipher = crypto.createCipheriv(
+    "aes-256-gcm",
+    key,
+    iv
+  );
+
+  const ciphertext = Buffer.concat([
+    cipher.update(token, "utf8"),
+    cipher.final(),
+  ]);
+
+  const authTag = cipher.getAuthTag();
+
+  return [
+    PLAID_TOKEN_ENCRYPTION_PREFIX.slice(0, -1),
+    iv.toString("base64url"),
+    authTag.toString("base64url"),
+    ciphertext.toString("base64url"),
+  ].join(":");
+}
+
+function decryptPlaidAccessToken(storedToken) {
+  const token = String(storedToken || "");
+
+  if (!token) {
+    throw new Error(
+      "Plaid access token is missing."
+    );
+  }
+
+  /*
+    Temporary backward compatibility:
+    existing tokens remain usable until the protected
+    migration encrypts them.
+  */
+  if (!token.startsWith(
+    PLAID_TOKEN_ENCRYPTION_PREFIX
+  )) {
+    return token;
+  }
+
+  const parts = token.split(":");
+
+  if (parts.length !== 5) {
+    throw new Error(
+      "Stored Plaid access token format is invalid."
+    );
+  }
+
+  const key = getPlaidTokenEncryptionKey();
+
+  const iv = Buffer.from(
+    parts[2],
+    "base64url"
+  );
+
+  const authTag = Buffer.from(
+    parts[3],
+    "base64url"
+  );
+
+  const ciphertext = Buffer.from(
+    parts[4],
+    "base64url"
+  );
+
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    key,
+    iv
+  );
+
+  decipher.setAuthTag(authTag);
+
+  const plaintext = Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]);
+
+  return plaintext.toString("utf8");
+}
 async function requireVerifiedTrackerMember(
   req,
   res,
@@ -425,7 +545,11 @@ app.post(
       values ($1, $2, $3)
       on conflict (plaid_item_id) do update set access_token = excluded.access_token
       `,
-      [tracker_id, item_id, access_token],
+[
+  tracker_id,
+  item_id,
+  encryptPlaidAccessToken(access_token),
+],
     );
 
     console.log('EXCHANGE-PUBLIC-TOKEN: calling accountsGet');
@@ -1374,8 +1498,13 @@ async function removePlaidTransaction(
 }
 
 async function syncPlaidItemTransactions(item) {
-  let cursor = item.transactions_cursor || null;
-  let hasMore = true;
+let cursor = item.transactions_cursor || null;
+let hasMore = true;
+
+const accessToken =
+  decryptPlaidAccessToken(
+    item.access_token
+  );
 
   let pagesProcessed = 0;
   let addedCount = 0;
@@ -1384,7 +1513,7 @@ async function syncPlaidItemTransactions(item) {
 
   while (hasMore) {
     const request = {
-      access_token: item.access_token,
+      access_token: accessToken,
     };
 
     if (cursor) {
@@ -2007,6 +2136,121 @@ async function evaluateAutomaticLateFees() {
 
   return summary;
 }
+// ============================================================
+// BACKEND SECURITY BUILD 1.5 — PLAID TOKEN ENCRYPTION MIGRATION
+// ============================================================
+
+app.post(
+  "/migrate-plaid-access-token-encryption",
+  async (req, res) => {
+    const migrationSecret =
+      req.headers[
+        "x-plaid-token-migration-secret"
+      ];
+
+    if (
+      !migrationSecret ||
+      migrationSecret !==
+        process.env.PLAID_TOKEN_MIGRATION_SECRET
+    ) {
+      return res.status(401).json({
+        error:
+          "Unauthorized Plaid token migration request.",
+      });
+    }
+
+    const summary = {
+      reviewed: 0,
+      migrated: 0,
+      already_encrypted: 0,
+      failed: 0,
+      errors: [],
+    };
+
+    try {
+      const { rows: items } = await pool.query(
+        `
+        select
+          plaid_item_id,
+          access_token
+        from public.plaid_items
+        where access_token is not null
+        `
+      );
+
+      for (const item of items) {
+        summary.reviewed += 1;
+
+        try {
+          const storedToken = String(
+            item.access_token || ""
+          );
+
+          if (storedToken.startsWith(
+            PLAID_TOKEN_ENCRYPTION_PREFIX
+          )) {
+            summary.already_encrypted += 1;
+            continue;
+          }
+
+          const encryptedToken =
+            encryptPlaidAccessToken(
+              storedToken
+            );
+
+          await pool.query(
+            `
+            update public.plaid_items
+            set access_token = $2
+            where plaid_item_id = $1
+            `,
+            [
+              item.plaid_item_id,
+              encryptedToken,
+            ]
+          );
+
+          summary.migrated += 1;
+
+        } catch (error) {
+          summary.failed += 1;
+
+          summary.errors.push(
+            error?.message || String(error)
+          );
+
+          console.error(
+            "Plaid token migration error:",
+            {
+              plaid_item_id:
+                item.plaid_item_id,
+              error:
+                error?.message || String(error),
+            }
+          );
+        }
+      }
+
+      return res.json({
+        success: true,
+        summary,
+      });
+
+    } catch (error) {
+      console.error(
+        "Plaid token migration route error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Plaid token migration failed.",
+        details:
+          error?.message || String(error),
+      });
+    }
+  }
+);
 /*
   Protected daily job.
 
