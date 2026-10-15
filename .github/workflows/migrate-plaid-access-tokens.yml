@@ -1,0 +1,22 @@
+name: Encrypt Existing Plaid Access Tokens
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  migrate-plaid-tokens:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Encrypt stored Plaid access tokens
+        env:
+          BACKEND_URL: ${{ secrets.RECURRING_TRANSFER_SERVICE_URL }}
+          PLAID_TOKEN_MIGRATION_SECRET: ${{ secrets.PLAID_TOKEN_MIGRATION_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "x-plaid-token-migration-secret: ${PLAID_TOKEN_MIGRATION_SECRET}" \
+            "${BACKEND_URL}/migrate-plaid-access-token-encryption"
