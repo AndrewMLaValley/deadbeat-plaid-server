@@ -336,6 +336,171 @@ async function requireVerifiedTrackerMember(
     });
   }
 }
+
+function stripePlanConfig(planKey) {
+  const plans = {
+    monthly: {
+      priceId:
+        process.env.STRIPE_MONTHLY_PRICE_ID || ""
+    },
+
+    annual: {
+      priceId:
+        process.env.STRIPE_ANNUAL_PRICE_ID || ""
+    }
+  };
+
+  return plans[planKey] || null;
+}
+
+app.post(
+  "/create-subscription-checkout",
+  requireVerifiedTrackerMember,
+  async (req, res) => {
+    try {
+      const stripe = getStripeClient();
+
+      if (!stripe) {
+        return res.status(503).json({
+          error:
+            "Stripe billing is not configured on the backend."
+        });
+      }
+
+      const {
+        tracker_id,
+        plan_key
+      } = req.body;
+
+      const plan = stripePlanConfig(plan_key);
+
+      if (!plan?.priceId) {
+        return res.status(400).json({
+          error:
+            "Choose a valid monthly or annual subscription plan."
+        });
+      }
+
+      const appBaseUrl = String(
+        process.env.APP_BASE_URL || ""
+      )
+        .trim()
+        .replace(/\/+$/, "");
+
+      if (!/^https:\/\//i.test(appBaseUrl)) {
+        return res.status(500).json({
+          error:
+            "The application return URL is not configured."
+        });
+      }
+
+      /*
+        Do not create duplicate trialing or active subscriptions.
+        Subscription management will be added later for existing users.
+      */
+      const { rows: existingSubscriptions } =
+        await pool.query(
+          `
+          select subscription_status
+          from public.billing_subscriptions
+          where user_id = $1
+          limit 1
+          `,
+          [req.authenticatedUserId]
+        );
+
+      const existingStatus =
+        existingSubscriptions[0]?.subscription_status;
+
+      if (
+        [
+          "trialing",
+          "active",
+          "past_due"
+        ].includes(existingStatus)
+      ) {
+        return res.status(409).json({
+          error:
+            "An active subscription already exists for this account."
+        });
+      }
+
+      const checkoutSession =
+        await stripe.checkout.sessions.create({
+          mode: "subscription",
+
+          line_items: [
+            {
+              price: plan.priceId,
+              quantity: 1
+            }
+          ],
+
+          /*
+            Stripe Checkout displays the promo-code field during
+            secure payment setup. Stripe validates MIL10 and any
+            future promotion codes—not the browser app.
+          */
+          allow_promotion_codes: true,
+
+          /*
+            Collect payment details during the trial so the
+            subscription can continue after the seven-day trial.
+          */
+          payment_method_collection: "always",
+
+          subscription_data: {
+            trial_period_days: 7,
+
+            metadata: {
+              user_id:
+                req.authenticatedUserId,
+
+              tracker_id:
+                tracker_id,
+
+              plan_key:
+                plan_key
+            }
+          },
+
+          metadata: {
+            user_id:
+              req.authenticatedUserId,
+
+            tracker_id:
+              tracker_id,
+
+            plan_key:
+              plan_key
+          },
+
+          success_url:
+            `${appBaseUrl}/?checkout=success&session_id=` +
+            `{CHECKOUT_SESSION_ID}`,
+
+          cancel_url:
+            `${appBaseUrl}/?checkout=canceled`
+        });
+
+      return res.json({
+        checkout_url: checkoutSession.url
+      });
+
+    } catch (error) {
+      console.error(
+        "Create Stripe Checkout session error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to start secure subscription checkout."
+      });
+    }
+  }
+);
+
 // Health check
 app.get('/', (req, res) => {
   res.json({ ok: true });
