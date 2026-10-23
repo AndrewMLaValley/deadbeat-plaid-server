@@ -9,7 +9,77 @@ const crypto = require('crypto');
 const { plaidClient } = require('./plaidClient');
 
 const app = express();
+
 app.use(cors());
+
+/*
+  Stripe webhook must use the untouched raw request body.
+  Keep this route above express.json().
+*/
+app.post(
+  "/stripe-webhook",
+  express.raw({
+    type: "application/json"
+  }),
+  (req, res) => {
+    const stripe = getStripeClient();
+
+    const webhookSecret =
+      process.env.STRIPE_WEBHOOK_SECRET || "";
+
+    const signature =
+      req.headers["stripe-signature"];
+
+    if (!stripe || !webhookSecret) {
+      console.error(
+        "Stripe webhook received before Stripe backend configuration."
+      );
+
+      return res.status(500).json({
+        error: "Stripe webhook is not configured."
+      });
+    }
+
+    if (!signature) {
+      return res.status(400).json({
+        error: "Missing Stripe webhook signature."
+      });
+    }
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret
+      );
+    } catch (error) {
+      console.error(
+        "Stripe webhook signature verification failed:",
+        error.message
+      );
+
+      return res.status(400).json({
+        error: "Invalid Stripe webhook signature."
+      });
+    }
+
+    /*
+      Subscription status processing is added in the next backend step.
+      This confirms the endpoint and signature-validation path first.
+    */
+    console.log(
+      "Verified Stripe webhook event:",
+      event.type
+    );
+
+    return res.json({
+      received: true
+    });
+  }
+);
+
 app.use(express.json());
 
 // Connect to Supabase Postgres via DATABASE_URL
