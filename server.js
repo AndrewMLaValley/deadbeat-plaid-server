@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
+const Stripe = require('stripe');
 const crypto = require('crypto');
 const { plaidClient } = require('./plaidClient');
 
@@ -21,6 +22,24 @@ const pool = new Pool({
 const resend = new Resend(
   process.env.RESEND_API_KEY
 );
+
+let stripeClient = null;
+
+function getStripeClient() {
+  const secretKey =
+    process.env.STRIPE_SECRET_KEY || "";
+
+  if (!secretKey) {
+    return null;
+  }
+
+  if (!stripeClient) {
+    stripeClient = new Stripe(secretKey);
+  }
+
+  return stripeClient;
+}
+
 const PLAID_TOKEN_ENCRYPTION_PREFIX =
   "enc:v1:";
 
