@@ -21,7 +21,7 @@ app.post(
   express.raw({
     type: "application/json"
   }),
-  (req, res) => {
+  async (req, res) => {
     const stripe = getStripeClient();
 
     const webhookSecret =
@@ -65,21 +65,153 @@ app.post(
       });
     }
 
-    /*
-      Subscription status processing is added in the next backend step.
-      This confirms the endpoint and signature-validation path first.
-    */
-    console.log(
-      "Verified Stripe webhook event:",
-      event.type
-    );
+    try {
+      if (
+        event.type ===
+        "checkout.session.completed"
+      ) {
+        const checkoutSession =
+          event.data.object;
 
-    return res.json({
-      received: true
-    });
+        if (
+          checkoutSession.mode !==
+          "subscription"
+        ) {
+          return res.json({
+            received: true
+          });
+        }
+
+        const subscriptionId =
+          stripeSubscriptionId(
+            checkoutSession.subscription
+          );
+
+        if (!subscriptionId) {
+          throw new Error(
+            "Checkout completion did not include a subscription ID."
+          );
+        }
+
+        const subscription =
+          await stripe.subscriptions.retrieve(
+            subscriptionId
+          );
+
+        const metadata = {
+          ...(checkoutSession.metadata || {}),
+          ...(subscription.metadata || {})
+        };
+
+        await upsertBillingSubscription({
+          userId: metadata.user_id || "",
+
+          customerId: stripeCustomerId(
+            checkoutSession.customer ||
+            subscription.customer
+          ),
+
+          subscriptionId,
+
+          planKey:
+            metadata.plan_key || "none",
+
+          subscriptionStatus:
+            subscription.status || "not_started",
+
+          trialEndsAt:
+            stripeUnixTimestampToIso(
+              subscription.trial_end
+            ),
+
+          currentPeriodEndsAt:
+            stripeUnixTimestampToIso(
+              subscription.current_period_end
+            ),
+
+          priceId:
+            subscription.items?.data?.[0]
+              ?.price?.id || "",
+
+          checkoutSessionId:
+            checkoutSession.id || ""
+        });
+
+        console.log(
+          "Checkout subscription recorded:",
+          subscriptionId
+        );
+      }
+
+      if (
+        event.type ===
+          "customer.subscription.created" ||
+        event.type ===
+          "customer.subscription.updated" ||
+        event.type ===
+          "customer.subscription.deleted"
+      ) {
+        const subscription =
+          event.data.object;
+
+        const metadata =
+          subscription.metadata || {};
+
+        await upsertBillingSubscription({
+          userId: metadata.user_id || "",
+
+          customerId: stripeCustomerId(
+            subscription.customer
+          ),
+
+          subscriptionId:
+            subscription.id || "",
+
+          planKey:
+            metadata.plan_key || "none",
+
+          subscriptionStatus:
+            subscription.status || "not_started",
+
+          trialEndsAt:
+            stripeUnixTimestampToIso(
+              subscription.trial_end
+            ),
+
+          currentPeriodEndsAt:
+            stripeUnixTimestampToIso(
+              subscription.current_period_end
+            ),
+
+          priceId:
+            subscription.items?.data?.[0]
+              ?.price?.id || ""
+        });
+
+        console.log(
+          "Subscription status recorded:",
+          subscription.id,
+          subscription.status
+        );
+      }
+
+      return res.json({
+        received: true
+      });
+
+    } catch (error) {
+      console.error(
+        "Stripe webhook processing error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to process Stripe webhook event."
+      });
+    }
   }
 );
-
 app.use(express.json());
 
 // Connect to Supabase Postgres via DATABASE_URL
@@ -112,7 +244,133 @@ function getStripeClient() {
 
 const PLAID_TOKEN_ENCRYPTION_PREFIX =
   "enc:v1:";
+function stripeUnixTimestampToIso(value) {
+  const timestamp = Number(value || 0);
 
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return null;
+  }
+
+  return new Date(
+    timestamp * 1000
+  ).toISOString();
+}
+
+function billingPlanKey(value) {
+  return [
+    "monthly",
+    "annual"
+  ].includes(value)
+    ? value
+    : "none";
+}
+
+function billingSubscriptionStatus(value) {
+  /*
+    These are the statuses currently used by the app's
+    duplicate-subscription guard. Other provider states are
+    safely treated as not started until expanded later.
+  */
+  return [
+    "trialing",
+    "active",
+    "past_due"
+  ].includes(value)
+    ? value
+    : "not_started";
+}
+
+function stripeCustomerId(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  return String(value?.id || "");
+}
+
+function stripeSubscriptionId(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  return String(value?.id || "");
+}
+
+async function upsertBillingSubscription({
+  userId,
+  customerId = "",
+  subscriptionId = "",
+  planKey = "none",
+  subscriptionStatus = "not_started",
+  trialEndsAt = null,
+  currentPeriodEndsAt = null,
+  priceId = "",
+  checkoutSessionId = ""
+}) {
+  if (!userId) {
+    throw new Error(
+      "A billing event did not include a user ID."
+    );
+  }
+
+  await pool.query(
+    `
+    insert into public.billing_subscriptions (
+      user_id,
+      stripe_customer_id,
+      stripe_subscription_id,
+      stripe_price_id,
+      stripe_checkout_session_id,
+      plan_key,
+      subscription_status,
+      trial_ends_at,
+      current_period_ends_at,
+      military_discount_applied,
+      updated_at
+    )
+    values (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9,
+      false, now()
+    )
+    on conflict (user_id)
+    do update set
+      stripe_customer_id =
+        excluded.stripe_customer_id,
+      stripe_subscription_id =
+        excluded.stripe_subscription_id,
+      stripe_price_id =
+        excluded.stripe_price_id,
+      stripe_checkout_session_id =
+        coalesce(
+          excluded.stripe_checkout_session_id,
+          stripe_checkout_session_id
+        ),
+        plan_key =
+        excluded.plan_key,
+      subscription_status =
+        excluded.subscription_status,
+      trial_ends_at =
+        excluded.trial_ends_at,
+      current_period_ends_at =
+        excluded.current_period_ends_at,
+      updated_at = now()
+    `,
+    [
+      userId,
+      customerId || null,
+      subscriptionId || null,
+      priceId || null,
+      checkoutSessionId || null,
+      billingPlanKey(planKey),
+      billingSubscriptionStatus(
+        subscriptionStatus
+      ),
+      trialEndsAt,
+      currentPeriodEndsAt
+    ]
+  );
+}
 function getPlaidTokenEncryptionKey() {
   const secret =
     process.env.PLAID_TOKEN_ENCRYPTION_KEY || "";
@@ -436,11 +694,11 @@ app.post(
             }
           ],
 
-          /*
-            Stripe Checkout displays the promo-code field during
-            secure payment setup. Stripe validates MIL10 and any
-            future promotion codes—not the browser app.
-          */
+  /*
+  Checkout displays the promo-code field during secure
+  payment setup. The payment provider validates submitted
+  promotion codes—not the browser app.
+*/
           allow_promotion_codes: true,
 
           /*
