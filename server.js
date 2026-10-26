@@ -315,7 +315,7 @@ async function upsertBillingSubscription({
 
   await pool.query(
     `
-    insert into public.billing_subscriptions (
+      insert into public.billing_subscriptions as billing (
       user_id,
       stripe_customer_id,
       stripe_subscription_id,
@@ -344,7 +344,7 @@ async function upsertBillingSubscription({
       stripe_checkout_session_id =
         coalesce(
           excluded.stripe_checkout_session_id,
-          stripe_checkout_session_id
+          billing.stripe_checkout_session_id
         ),
         plan_key =
         excluded.plan_key,
