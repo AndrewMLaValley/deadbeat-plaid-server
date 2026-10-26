@@ -625,10 +625,9 @@ app.post(
         });
       }
 
-      const {
+          const {
         tracker_id,
-        plan_key,
-        promo_code
+        plan_key
       } = req.body;
 
       const plan = stripePlanConfig(plan_key);
@@ -640,37 +639,7 @@ app.post(
         });
       }
 
-      const promoCode = String(
-        promo_code || ""
-      )
-        .trim()
-        .slice(0, 40);
-
-      let promotionCodeId = "";
-
-      if (promoCode) {
-        const promotionCodeResult =
-          await stripe.promotionCodes.list({
-            code: promoCode,
-            active: true,
-            limit: 1
-          });
-
-        const matchingPromotionCode =
-          promotionCodeResult.data?.[0];
-
-        if (!matchingPromotionCode) {
-          return res.status(400).json({
-            error:
-              "That promo code is not valid or is no longer active."
-          });
-        }
-
-        promotionCodeId =
-          matchingPromotionCode.id;
-      }
-
-      const appBaseUrl = String(
+        const appBaseUrl = String(
         process.env.APP_BASE_URL || ""
       )
         .trim()
@@ -725,24 +694,12 @@ app.post(
             }
           ],
 
-  /*
-  Checkout displays the promo-code field during secure
-  payment setup. The payment provider validates submitted
-  promotion codes—not the browser app.
-*/
-                    allow_promotion_codes:
-            !promotionCodeId,
-
-          ...(promotionCodeId
-            ? {
-                discounts: [
-                  {
-                    promotion_code:
-                      promotionCodeId
-                  }
-                ]
-              }
-            : {}),
+          /*
+            Checkout displays the optional generic promo-code field
+            during secure payment setup. The payment provider
+            validates submitted promotion codes.
+          */
+          allow_promotion_codes: true,
 
           /*
             Collect payment details during the trial so the
@@ -763,9 +720,7 @@ app.post(
                          plan_key:
                 plan_key,
 
-              promo_code:
-                promoCode
-            
+           
             }
           },
 
@@ -779,8 +734,6 @@ app.post(
               plan_key:
                 plan_key,
 
-              promo_code:
-                promoCode
           },
 
           success_url:
