@@ -123,7 +123,6 @@ app.post(
             stripeUnixTimestampToIso(
               subscription.trial_end
             ),
-
           currentPeriodEndsAt:
             stripeUnixTimestampToIso(
               subscription.items?.data?.[0]
