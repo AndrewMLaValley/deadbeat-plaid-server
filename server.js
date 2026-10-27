@@ -126,6 +126,8 @@ app.post(
 
           currentPeriodEndsAt:
             stripeUnixTimestampToIso(
+              subscription.items?.data?.[0]
+                ?.current_period_end ||
               subscription.current_period_end
             ),
 
@@ -178,8 +180,10 @@ app.post(
               subscription.trial_end
             ),
 
-          currentPeriodEndsAt:
+             currentPeriodEndsAt:
             stripeUnixTimestampToIso(
+              subscription.items?.data?.[0]
+                ?.current_period_end ||
               subscription.current_period_end
             ),
 
