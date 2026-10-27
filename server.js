@@ -766,7 +766,103 @@ app.post(
     }
   }
 );
+app.get(
+  "/subscription-access",
+  requireVerifiedTrackerMember,
+  async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `
+        select
+          profile.billing_grandfathered,
 
+          billing.subscription_status,
+          billing.access_override,
+          billing.access_override_reason,
+          billing.plan_key,
+          billing.trial_ends_at,
+          billing.current_period_ends_at
+
+        from public.profiles as profile
+
+        left join public.billing_subscriptions as billing
+          on billing.user_id = profile.id
+
+        where profile.id = $1
+        limit 1
+        `,
+        [req.authenticatedUserId]
+      );
+
+      const account = rows[0];
+
+      if (!account) {
+        return res.status(404).json({
+          error:
+            "Subscription access information was not found."
+        });
+      }
+
+      const subscriptionStatus =
+        account.subscription_status ||
+        "not_started";
+
+      const hasCompedAccess =
+        account.access_override === true;
+
+      const isGrandfathered =
+        account.billing_grandfathered === true;
+
+      const hasValidSubscription =
+        [
+          "trialing",
+          "active"
+        ].includes(subscriptionStatus);
+
+      const allowed =
+        hasCompedAccess ||
+        isGrandfathered ||
+        hasValidSubscription;
+
+      const accessReason =
+        hasCompedAccess
+          ? "comped_access"
+          : isGrandfathered
+            ? "grandfathered_access"
+            : hasValidSubscription
+              ? "subscription_access"
+              : "billing_required";
+
+      return res.json({
+        allowed,
+        access_reason: accessReason,
+
+        subscription_status:
+          subscriptionStatus,
+
+        plan_key:
+          account.plan_key || "none",
+
+        trial_ends_at:
+          account.trial_ends_at || null,
+
+        current_period_ends_at:
+          account.current_period_ends_at || null
+      });
+
+    } catch (error) {
+      console.error(
+        "Subscription-access route error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to evaluate subscription access."
+      });
+    }
+  }
+);
 // Health check
 app.get('/', (req, res) => {
   res.json({ ok: true });
