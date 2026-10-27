@@ -863,6 +863,83 @@ app.get(
     }
   }
 );
+app.post(
+  "/create-billing-portal",
+  requireVerifiedTrackerMember,
+  async (req, res) => {
+    try {
+      const stripe = getStripeClient();
+
+      if (!stripe) {
+        return res.status(503).json({
+          error:
+            "Billing is not configured on the backend."
+        });
+      }
+
+      const appBaseUrl = String(
+        process.env.APP_BASE_URL || ""
+      )
+        .trim()
+        .replace(/\/+$/, "");
+
+      if (!/^https:\/\//i.test(appBaseUrl)) {
+        return res.status(500).json({
+          error:
+            "The application return URL is not configured."
+        });
+      }
+
+      const { rows } = await pool.query(
+        `
+        select
+          stripe_customer_id,
+          subscription_status,
+          access_override
+
+        from public.billing_subscriptions
+
+        where user_id = $1
+        limit 1
+        `,
+        [req.authenticatedUserId]
+      );
+
+      const billing = rows[0];
+
+      if (!billing?.stripe_customer_id) {
+        return res.status(400).json({
+          error:
+            "No billing customer record exists for this account."
+        });
+      }
+
+      const portalSession =
+        await stripe.billingPortal.sessions.create({
+          customer:
+            billing.stripe_customer_id,
+
+          return_url:
+            `${appBaseUrl}/?billing=return`
+        });
+
+      return res.json({
+        portal_url: portalSession.url
+      });
+
+    } catch (error) {
+      console.error(
+        "Create billing portal error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to open billing management."
+      });
+    }
+  }
+);
 // Health check
 app.get('/', (req, res) => {
   res.json({ ok: true });
