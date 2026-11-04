@@ -1203,122 +1203,366 @@ app.post(
   '/exchange-public-token',
   requireVerifiedTrackerMember,
   async (req, res) => {
-  console.log('EXCHANGE-PUBLIC-TOKEN endpoint hit');
+    console.log('EXCHANGE-PUBLIC-TOKEN endpoint hit');
 
-  const authHeader = req.headers.authorization || '';
-  const jwt = authHeader.replace('Bearer ', '').trim();
-  if (!jwt) {
-    console.log('EXCHANGE-PUBLIC-TOKEN missing JWT');
-    return res.status(401).json({ error: 'Missing JWT' });
-  }
+    const { public_token } = req.body || {};
 
-  const { public_token, tracker_id } = req.body;
-  if (!public_token || !tracker_id) {
-    console.log('EXCHANGE-PUBLIC-TOKEN missing fields', {
-      publicTokenPresent: !!public_token,
-      trackerIdPresent: !!tracker_id,
-    });
-    return res.status(400).json({ error: 'public_token and tracker_id are required' });
-  }
+    /*
+      Do not trust tracker_id or user identity from the browser
+      after middleware verification. Use the middleware-derived
+      values instead.
+    */
+    const trackerId = req.authenticatedTrackerId;
+    const authenticatedUserId = req.authenticatedUserId;
 
-  console.log('EXCHANGE-PUBLIC-TOKEN for tracker_id:', tracker_id);
+    if (!public_token) {
+      console.log('EXCHANGE-PUBLIC-TOKEN missing public_token');
 
-  const client = await pool.connect();
-  try {
-    console.log('EXCHANGE-PUBLIC-TOKEN: calling itemPublicTokenExchange');
-    const tokenResponse = await plaidClient.itemPublicTokenExchange({ public_token });
-    const access_token = tokenResponse.data.access_token;
-    const item_id = tokenResponse.data.item_id;
-    console.log('EXCHANGE-PUBLIC-TOKEN: got item_id', item_id);
+      return res.status(400).json({
+        error: 'public_token is required',
+      });
+    }
 
-    console.log('EXCHANGE-PUBLIC-TOKEN: upserting into plaid_items');
-    await client.query(
-      `
-      insert into public.plaid_items (tracker_id, plaid_item_id, access_token)
-      values ($1, $2, $3)
-      on conflict (plaid_item_id) do update set access_token = excluded.access_token
-      `,
-[
-  tracker_id,
-  item_id,
-  encryptPlaidAccessToken(access_token),
-],
+    if (!trackerId || !authenticatedUserId) {
+      console.error(
+        'EXCHANGE-PUBLIC-TOKEN missing verified tracker or user identity.'
+      );
+
+      return res.status(500).json({
+        error: 'Verified tracker authorization was not available.',
+      });
+    }
+
+    console.log(
+      'EXCHANGE-PUBLIC-TOKEN for verified tracker_id:',
+      trackerId
     );
 
-    console.log('EXCHANGE-PUBLIC-TOKEN: calling accountsGet');
-    const accountsResponse = await plaidClient.accountsGet({ access_token });
-    const { accounts } = accountsResponse.data;
-    console.log('EXCHANGE-PUBLIC-TOKEN: received', accounts.length, 'accounts');
+    const client = await pool.connect();
+    let transactionStarted = false;
 
-    console.log('EXCHANGE-PUBLIC-TOKEN: upserting into linked_accounts');
-    for (const acct of accounts) {
-      const {
-        account_id,
-        name,
-        mask,
-        official_name,
-        subtype,
-        type,
-        balances,
-      } = acct;
+    try {
+      /*
+        Perform Plaid network requests before opening the database
+        transaction so a slow provider response does not hold a
+        database lock unnecessarily.
+      */
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: calling itemPublicTokenExchange'
+      );
 
-      const current_balance = balances.current;
-      const available_balance = balances.available;
+      const tokenResponse =
+        await plaidClient.itemPublicTokenExchange({
+          public_token,
+        });
 
-      await client.query(
+      const access_token = tokenResponse.data.access_token;
+      const item_id = tokenResponse.data.item_id;
+
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: got item_id',
+        item_id
+      );
+
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: calling accountsGet'
+      );
+
+      const accountsResponse =
+        await plaidClient.accountsGet({
+          access_token,
+        });
+
+      const accounts = accountsResponse.data.accounts || [];
+
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: received',
+        accounts.length,
+        'accounts'
+      );
+
+      await client.query('BEGIN');
+      transactionStarted = true;
+
+      /*
+        Ownership check for an existing Plaid Item.
+
+        Allowed:
+        - new Item;
+        - same owner relinking;
+        - legacy unclaimed Item being claimed by the verified user.
+
+        Blocked:
+        - assigning another tracker's Item to this tracker;
+        - taking ownership from another tracker member.
+      */
+      const existingItemResult = await client.query(
         `
-        insert into public.linked_accounts (
+        select
+          tracker_id,
+          owner_user_id
+        from public.plaid_items
+        where plaid_item_id = $1
+        for update
+        `,
+        [item_id]
+      );
+
+      const existingItem = existingItemResult.rows[0];
+
+      if (
+        existingItem &&
+        (
+          existingItem.tracker_id !== trackerId ||
+          (
+            existingItem.owner_user_id &&
+            existingItem.owner_user_id !== authenticatedUserId
+          )
+        )
+      ) {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+
+        return res.status(403).json({
+          error:
+            'This linked institution is already associated with another tracker member or tracker.',
+        });
+      }
+
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: upserting into plaid_items'
+      );
+
+      /*
+        The conflict WHERE clause also protects against a rare
+        concurrent link attempt occurring after the preceding check.
+      */
+      const plaidItemUpsert = await client.query(
+        `
+        insert into public.plaid_items (
           tracker_id,
           plaid_item_id,
-          plaid_account_id,
-          institution_name,
-          plaid_account_name,
-          plaid_account_mask,
-          plaid_account_type,
-          plaid_account_subtype,
-          current_balance,
-          available_balance
+          access_token,
+          owner_user_id
         )
-        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        on conflict (plaid_account_id) do update set
-          institution_name = excluded.institution_name,
-          plaid_account_name = excluded.plaid_account_name,
-          plaid_account_mask = excluded.plaid_account_mask,
-          plaid_account_type = excluded.plaid_account_type,
-          plaid_account_subtype = excluded.plaid_account_subtype,
-          current_balance = excluded.current_balance,
-          available_balance = excluded.available_balance
+        values ($1, $2, $3, $4)
+
+        on conflict (plaid_item_id)
+        do update set
+          access_token = excluded.access_token,
+          owner_user_id = coalesce(
+            public.plaid_items.owner_user_id,
+            excluded.owner_user_id
+          )
+
+        where public.plaid_items.tracker_id =
+              excluded.tracker_id
+          and (
+            public.plaid_items.owner_user_id is null
+            or public.plaid_items.owner_user_id =
+               excluded.owner_user_id
+          )
+
+        returning plaid_item_id
         `,
         [
-          tracker_id,
+          trackerId,
           item_id,
-          account_id,
-          official_name || name || null,
-          name || official_name || 'Account',
-          mask || null,
-          type || null,
-          subtype || null,
-          current_balance,
-          available_balance,
-        ],
+          encryptPlaidAccessToken(access_token),
+          authenticatedUserId,
+        ]
       );
-    }
 
-    console.log('EXCHANGE-PUBLIC-TOKEN: success for tracker_id', tracker_id);
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('exchange-public-token error FULL:', err);
-    if (err.response && err.response.data) {
-      console.error('exchange-public-token error RESPONSE DATA:', err.response.data);
+      if (!plaidItemUpsert.rows.length) {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+
+        return res.status(403).json({
+          error:
+            'The linked institution could not be assigned to this tracker member.',
+        });
+      }
+
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: upserting into linked_accounts'
+      );
+
+      for (const acct of accounts) {
+        const {
+          account_id,
+          name,
+          mask,
+          official_name,
+          subtype,
+          type,
+          balances,
+        } = acct;
+
+        /*
+          Check whether this individual account has already been
+          claimed by another tracker or tracker member.
+        */
+        const existingLinkedAccountResult =
+          await client.query(
+            `
+            select
+              tracker_id,
+              owner_user_id
+            from public.linked_accounts
+            where plaid_account_id = $1
+            for update
+            `,
+            [account_id]
+          );
+
+        const existingLinkedAccount =
+          existingLinkedAccountResult.rows[0];
+
+        if (
+          existingLinkedAccount &&
+          (
+            existingLinkedAccount.tracker_id !== trackerId ||
+            (
+              existingLinkedAccount.owner_user_id &&
+              existingLinkedAccount.owner_user_id !==
+                authenticatedUserId
+            )
+          )
+        ) {
+          await client.query('ROLLBACK');
+          transactionStarted = false;
+
+          return res.status(403).json({
+            error:
+              'A linked bank account is already associated with another tracker member or tracker.',
+          });
+        }
+
+        const linkedAccountUpsert =
+          await client.query(
+            `
+            insert into public.linked_accounts (
+              tracker_id,
+              plaid_item_id,
+              plaid_account_id,
+              owner_user_id,
+              institution_name,
+              plaid_account_name,
+              plaid_account_mask,
+              plaid_account_type,
+              plaid_account_subtype,
+              current_balance,
+              available_balance
+            )
+            values (
+              $1, $2, $3, $4, $5,
+              $6, $7, $8, $9, $10, $11
+            )
+
+            on conflict (plaid_account_id)
+            do update set
+              plaid_item_id = excluded.plaid_item_id,
+              owner_user_id = coalesce(
+                public.linked_accounts.owner_user_id,
+                excluded.owner_user_id
+              ),
+              institution_name = excluded.institution_name,
+              plaid_account_name =
+                excluded.plaid_account_name,
+              plaid_account_mask =
+                excluded.plaid_account_mask,
+              plaid_account_type =
+                excluded.plaid_account_type,
+              plaid_account_subtype =
+                excluded.plaid_account_subtype,
+              current_balance =
+                excluded.current_balance,
+              available_balance =
+                excluded.available_balance
+
+            where public.linked_accounts.tracker_id =
+                  excluded.tracker_id
+              and (
+                public.linked_accounts.owner_user_id is null
+                or public.linked_accounts.owner_user_id =
+                   excluded.owner_user_id
+              )
+
+            returning id
+            `,
+            [
+              trackerId,
+              item_id,
+              account_id,
+              authenticatedUserId,
+              official_name || name || null,
+              name || official_name || 'Account',
+              mask || null,
+              type || null,
+              subtype || null,
+              balances?.current ?? null,
+              balances?.available ?? null,
+            ]
+          );
+
+        if (!linkedAccountUpsert.rows.length) {
+          await client.query('ROLLBACK');
+          transactionStarted = false;
+
+          return res.status(403).json({
+            error:
+              'A linked bank account could not be assigned to this tracker member.',
+          });
+        }
+      }
+
+      await client.query('COMMIT');
+      transactionStarted = false;
+
+      console.log(
+        'EXCHANGE-PUBLIC-TOKEN: success for tracker_id',
+        trackerId
+      );
+
+      return res.json({
+        success: true,
+        accounts_linked: accounts.length,
+      });
+
+    } catch (err) {
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          console.error(
+            'EXCHANGE-PUBLIC-TOKEN rollback error:',
+            rollbackError
+          );
+        }
+      }
+
+      console.error('exchange-public-token error FULL:', err);
+
+      if (err.response?.data) {
+        console.error(
+          'exchange-public-token error RESPONSE DATA:',
+          err.response.data
+        );
+      }
+
+      return res.status(500).json({
+        error: 'Failed to exchange public token',
+        details:
+          err.response?.data ||
+          err.message ||
+          String(err),
+      });
+
+    } finally {
+      client.release();
     }
-    return res.status(500).json({
-      error: 'Failed to exchange public token',
-      details: err.response?.data || err.message || String(err),
-    });
-  } finally {
-    client.release();
   }
-});
+);
 
 // Get linked accounts for a tracker
 app.get(
@@ -1434,7 +1678,17 @@ app.post(
     }
 
     const linkedAccount = accountResult.rows[0];
+if (
+  linkedAccount.owner_user_id &&
+  linkedAccount.owner_user_id !== req.authenticatedUserId
+) {
+  await client.query('ROLLBACK');
 
+  return res.status(403).json({
+    error:
+      'Only the tracker member who linked this bank account can unlink it.',
+  });
+}
     // Remove any card → Plaid account mappings first.
     // This prevents stale mappings from referencing the removed account.
     await client.query(
