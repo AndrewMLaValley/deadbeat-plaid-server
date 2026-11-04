@@ -2299,21 +2299,157 @@ async function recordPlaidSyncFailure(
     ]
   );
 }
+function utcCalendarDate(year, monthIndex, requestedDay) {
+  const lastDayOfMonth = new Date(
+    Date.UTC(year, monthIndex + 1, 0)
+  ).getUTCDate();
 
+  const safeDay = Math.min(
+    Math.max(Number(requestedDay) || 1, 1),
+    lastDayOfMonth
+  );
+
+  return new Date(
+    Date.UTC(year, monthIndex, safeDay)
+  );
+}
+
+function currentStatementCycleForCard(
+  asOfDate,
+  cycleEndDay
+) {
+  const normalizedCycleEndDay = Number(cycleEndDay);
+
+  if (
+    !Number.isInteger(normalizedCycleEndDay) ||
+    normalizedCycleEndDay < 1 ||
+    normalizedCycleEndDay > 31
+  ) {
+    return null;
+  }
+
+  const asOf = new Date(
+    Date.UTC(
+      asOfDate.getUTCFullYear(),
+      asOfDate.getUTCMonth(),
+      asOfDate.getUTCDate()
+    )
+  );
+
+  const thisMonthCycleEnd = utcCalendarDate(
+    asOf.getUTCFullYear(),
+    asOf.getUTCMonth(),
+    normalizedCycleEndDay
+  );
+
+  const statementCycleEnd =
+    asOf <= thisMonthCycleEnd
+      ? thisMonthCycleEnd
+      : utcCalendarDate(
+          asOf.getUTCFullYear(),
+          asOf.getUTCMonth() + 1,
+          normalizedCycleEndDay
+        );
+
+  const previousCycleEnd = utcCalendarDate(
+    statementCycleEnd.getUTCFullYear(),
+    statementCycleEnd.getUTCMonth() - 1,
+    normalizedCycleEndDay
+  );
+
+  const statementCycleStart = addUtcDays(
+    previousCycleEnd,
+    1
+  );
+
+  return {
+    statementCycleStart,
+    statementCycleEnd,
+    statementCycleStartKey: utcDateKey(
+      statementCycleStart
+    ),
+    statementCycleEndKey: utcDateKey(
+      statementCycleEnd
+    ),
+  };
+}
+
+function scheduledDateWithinStatementCycle(
+  statementCycleStart,
+  statementCycleEnd,
+  chargeDay
+) {
+  const normalizedChargeDay = Number(chargeDay);
+
+  if (
+    !Number.isInteger(normalizedChargeDay) ||
+    normalizedChargeDay < 1 ||
+    normalizedChargeDay > 31
+  ) {
+    return null;
+  }
+
+  let cursor = new Date(
+    Date.UTC(
+      statementCycleStart.getUTCFullYear(),
+      statementCycleStart.getUTCMonth(),
+      1
+    )
+  );
+
+  const finalMonth = new Date(
+    Date.UTC(
+      statementCycleEnd.getUTCFullYear(),
+      statementCycleEnd.getUTCMonth(),
+      1
+    )
+  );
+
+  while (cursor <= finalMonth) {
+    const candidate = utcCalendarDate(
+      cursor.getUTCFullYear(),
+      cursor.getUTCMonth(),
+      normalizedChargeDay
+    );
+
+    if (
+      candidate >= statementCycleStart &&
+      candidate <= statementCycleEnd
+    ) {
+      return candidate;
+    }
+
+    cursor = new Date(
+      Date.UTC(
+        cursor.getUTCFullYear(),
+        cursor.getUTCMonth() + 1,
+        1
+      )
+    );
+  }
+
+  return null;
+}
+
+function utcMonthStartKey(dateValue) {
+  const dateKey = utcDateKey(dateValue);
+
+  return `${dateKey.slice(0, 7)}-01`;
+}
 async function matchRecurringTransfersFromBank() {
   const today = new Date();
-
   const todayKey = utcDateKey(today);
 
-  const completionMonth =
-    currentUtcCompletionMonth();
-
   /*
-    A bank-linked recurring transfer is eligible only when:
-    - it is active;
-    - bank matching is explicitly enabled;
-    - it is mapped to a locally saved Plaid-backed bank account;
-    - it has not already been completed this calendar month.
+    Eligible items are recurring transfers that:
+    - remain active;
+    - explicitly permit bank matching;
+    - move cash;
+    - are tied to a local Plaid-backed bank account; and
+    - belong to a card with a configured statement-cycle end day.
+
+    Completion status is evaluated per card statement cycle below,
+    because statement-cycle dates differ by card.
   */
   const { rows: recurringTransfers } =
     await pool.query(
@@ -2326,34 +2462,37 @@ async function matchRecurringTransfersFromBank() {
         recurring.charge_day,
         recurring.bank_match_description,
 
+        card.cycle_end_day,
+
         linked.plaid_account_id
 
       from public.card_recurring_charges as recurring
 
+      join public.cards as card
+        on card.id = recurring.card_id
+       and card.tracker_id = recurring.tracker_id
+
       join public.bank_accounts as bank
         on bank.id = recurring.bank_account_id
+       and bank.tracker_id = recurring.tracker_id
 
       join public.linked_accounts as linked
         on linked.id::text =
-          bank.plaid_linked_account_id
-
-      left join public.recurring_transfer_completions
-        as completion
-        on completion.recurring_charge_id =
-             recurring.id
-        and completion.completion_month = $1
+             bank.plaid_linked_account_id
 
       where recurring.active is distinct from false
+        and recurring.cash_moved = true
         and recurring.bank_match_enabled = true
         and recurring.bank_account_id is not null
-        and completion.id is null
-      `,
-      [completionMonth]
+        and bank.active is distinct from false
+      `
     );
 
   const summary = {
     eligible: recurringTransfers.length,
     matched: 0,
+    already_completed: 0,
+    skipped_invalid_configuration: 0,
     skipped_not_due: 0,
     skipped_outside_window: 0,
     skipped_ambiguous: 0,
@@ -2363,18 +2502,81 @@ async function matchRecurringTransfersFromBank() {
 
   for (const recurring of recurringTransfers) {
     try {
+      const statementCycle =
+        currentStatementCycleForCard(
+          today,
+          recurring.cycle_end_day
+        );
+
+      if (!statementCycle) {
+        summary.skipped_invalid_configuration += 1;
+
+        console.warn(
+          "Recurring transfer skipped: invalid card cycle_end_day.",
+          {
+            recurring_charge_id:
+              recurring.recurring_charge_id,
+            card_id: recurring.card_id,
+            cycle_end_day: recurring.cycle_end_day,
+          }
+        );
+
+        continue;
+      }
+
       const scheduledDate =
-        scheduledDateForCurrentMonth(
+        scheduledDateWithinStatementCycle(
+          statementCycle.statementCycleStart,
+          statementCycle.statementCycleEnd,
           recurring.charge_day
         );
 
-      const scheduledDateKey =
-        utcDateKey(scheduledDate);
+      if (!scheduledDate) {
+        summary.skipped_invalid_configuration += 1;
+
+        console.warn(
+          "Recurring transfer skipped: invalid charge_day.",
+          {
+            recurring_charge_id:
+              recurring.recurring_charge_id,
+            charge_day: recurring.charge_day,
+          }
+        );
+
+        continue;
+      }
 
       /*
-        Do not evaluate a transfer until the day after its
-        scheduled date. This matches the app's green-to-amber
-        behavior.
+        Do not process an already confirmed recurring transfer
+        for this specific statement cycle.
+      */
+      const { rows: existingCompletion } =
+        await pool.query(
+          `
+          select id
+          from public.recurring_transfer_completions
+          where recurring_charge_id = $1
+            and statement_cycle_start_date = $2
+          limit 1
+          `,
+          [
+            recurring.recurring_charge_id,
+            statementCycle.statementCycleStartKey,
+          ]
+        );
+
+      if (existingCompletion.length) {
+        summary.already_completed += 1;
+        continue;
+      }
+
+      const scheduledDateKey = utcDateKey(
+        scheduledDate
+      );
+
+      /*
+        Do not evaluate a transfer until the calendar day after
+        its scheduled date. This retains the existing app behavior.
       */
       if (todayKey <= scheduledDateKey) {
         summary.skipped_not_due += 1;
@@ -2382,9 +2584,9 @@ async function matchRecurringTransfersFromBank() {
       }
 
       /*
-        To avoid incorrectly confirming an older unrelated
-        transaction, consider only the scheduled date through
-        five days afterward.
+        Limit automatic confirmation to the scheduled date plus
+        five days, preventing stale or unrelated transactions
+        from being auto-confirmed.
       */
       const latestMatchDate = addUtcDays(
         scheduledDate,
@@ -2404,14 +2606,6 @@ async function matchRecurringTransfersFromBank() {
         recurring.bank_match_description || ""
       ).trim();
 
-      /*
-        A high-confidence candidate must:
-        - come from the selected Plaid account;
-        - be posted, not pending;
-        - fall in the allowed date window;
-        - match the amount to the cent;
-        - match optional description text, if supplied.
-      */
       const { rows: candidates } =
         await pool.query(
           `
@@ -2427,14 +2621,14 @@ async function matchRecurringTransfersFromBank() {
             and pending = false
             and transaction_date >= $3
             and transaction_date <= $4
-           and amount > 0
-and abs(amount - $5) < 0.01
+            and amount > 0
+            and abs(amount - $5) < 0.01
             and (
               $6 = ''
               or coalesce(name, '') ilike
-                '%' || $6 || '%'
+                   '%' || $6 || '%'
               or coalesce(merchant_name, '') ilike
-                '%' || $6 || '%'
+                   '%' || $6 || '%'
             )
           order by transaction_date asc
           limit 2
@@ -2455,8 +2649,8 @@ and abs(amount - $5) < 0.01
       }
 
       /*
-        More than one matching transaction means the match is
-        uncertain. Leave the item amber for manual confirmation.
+        Two possible matches is not high confidence. Leave the
+        item available for manual confirmation rather than choosing.
       */
       if (candidates.length !== 1) {
         summary.skipped_ambiguous += 1;
@@ -2472,14 +2666,18 @@ and abs(amount - $5) < 0.01
           card_id,
           recurring_charge_id,
           completion_month,
+          statement_cycle_start_date,
+          statement_cycle_end_date,
           completed_on,
           confirmation_source,
           bank_transaction_id
         )
-        values ($1, $2, $3, $4, $5, 'bank', $6)
+        values (
+          $1, $2, $3, $4, $5, $6, $7, 'bank', $8
+        )
         on conflict (
           recurring_charge_id,
-          completion_month
+          statement_cycle_start_date
         )
         do nothing
         `,
@@ -2487,7 +2685,15 @@ and abs(amount - $5) < 0.01
           recurring.tracker_id,
           recurring.card_id,
           recurring.recurring_charge_id,
-          completionMonth,
+
+          /*
+            Retained only for compatibility with the legacy column.
+            Statement-cycle columns are now authoritative.
+          */
+          utcMonthStartKey(candidate.transaction_date),
+
+          statementCycle.statementCycleStartKey,
+          statementCycle.statementCycleEndKey,
           candidate.transaction_date,
           candidate.plaid_transaction_id,
         ]
@@ -2501,12 +2707,15 @@ and abs(amount - $5) < 0.01
           {
             recurring_charge_id:
               recurring.recurring_charge_id,
+            statement_cycle_start_date:
+              statementCycle.statementCycleStartKey,
+            statement_cycle_end_date:
+              statementCycle.statementCycleEndKey,
             plaid_transaction_id:
               candidate.plaid_transaction_id,
           }
         );
       }
-
     } catch (error) {
       console.error(
         "Recurring transfer match error:",
