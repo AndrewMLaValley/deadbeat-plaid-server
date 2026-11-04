@@ -1594,6 +1594,10 @@ app.get(
         tracker_id,
         plaid_item_id,
         plaid_account_id,
+     coalesce(
+  owner_user_id = $2,
+  false
+) as is_owned_by_current_user,
         institution_name,
         plaid_account_name,
         plaid_account_mask,
@@ -1605,7 +1609,10 @@ app.get(
       where tracker_id = $1
       order by institution_name, plaid_account_name
       `,
-      [tracker_id],
+     [
+  req.authenticatedTrackerId,
+  req.authenticatedUserId,
+],  
     );
 
     console.log('LINKED-ACCOUNTS: found', rows.length, 'accounts');
