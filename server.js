@@ -1175,7 +1175,8 @@ app.post(
     console.log('CREATE-LINK-TOKEN for tracker_id:', tracker_id);
 
     const request = {
-      user: { client_user_id: tracker_id },
+    user: {  client_user_id: req.authenticatedUserId
+}, 
       client_name: 'Deadbeat Tracker',
       products: ['auth', 'transactions'],
       country_codes: ['US'],
@@ -1660,15 +1661,16 @@ app.post(
 
     const accountResult = await client.query(
       `
-      select
-        id,
-        tracker_id,
-        plaid_item_id,
-        plaid_account_id,
-        institution_name,
-        plaid_account_name,
-        plaid_account_mask
-      from public.linked_accounts
+select
+  id,
+  tracker_id,
+  plaid_item_id,
+  plaid_account_id,
+  owner_user_id,
+  institution_name,
+  plaid_account_name,
+  plaid_account_mask
+from public.linked_accounts
       where id = $1
         and tracker_id = $2
       for update
