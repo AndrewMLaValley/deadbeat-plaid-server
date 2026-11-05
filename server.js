@@ -1751,6 +1751,375 @@ if (
     client.release();
   }
 });
+/*
+  STEP 4 — SECURE BANK-TRANSFER INTENT
+
+  This route records a pending, server-validated transfer intent.
+  It does not submit money movement to any provider yet.
+*/
+app.post(
+  "/create-bank-transfer",
+  requireVerifiedTrackerMember,
+  async (req, res) => {
+    const {
+      from_bank_account_id,
+      to_bank_account_id,
+      amount,
+      transfer_date,
+      notes,
+      idempotency_key,
+    } = req.body || {};
+
+    const trackerId = req.authenticatedTrackerId;
+    const authenticatedUserId =
+      req.authenticatedUserId;
+
+    const normalizedIdempotencyKey = String(
+      idempotency_key || ""
+    ).trim();
+
+    const normalizedNotes = String(
+      notes || ""
+    ).trim();
+
+    const amountNumber = Number(amount || 0);
+    const amountInCents = Math.round(
+      amountNumber * 100
+    );
+
+    const normalizedAmount =
+      amountInCents / 100;
+
+    const validDateFormat =
+      /^\d{4}-\d{2}-\d{2}$/.test(
+        String(transfer_date || "")
+      );
+
+    const parsedDate = validDateFormat
+      ? new Date(`${transfer_date}T00:00:00.000Z`)
+      : null;
+
+    const validCalendarDate =
+      parsedDate &&
+      parsedDate.toISOString().slice(0, 10) ===
+        transfer_date;
+
+    if (
+      !from_bank_account_id ||
+      !to_bank_account_id ||
+      !amount ||
+      !transfer_date ||
+      !normalizedIdempotencyKey
+    ) {
+      return res.status(400).json({
+        error:
+          "Source account, destination account, amount, transfer date, and idempotency key are required.",
+      });
+    }
+
+    if (from_bank_account_id === to_bank_account_id) {
+      return res.status(400).json({
+        error:
+          "Source and destination bank accounts must be different.",
+      });
+    }
+
+    if (
+      !Number.isFinite(amountNumber) ||
+      amountInCents <= 0 ||
+      Math.abs(amountNumber - normalizedAmount) >
+        0.000001
+    ) {
+      return res.status(400).json({
+        error:
+          "Enter a valid transfer amount greater than zero with no more than two decimal places.",
+      });
+    }
+
+    if (!validCalendarDate) {
+      return res.status(400).json({
+        error:
+          "Enter a valid transfer date.",
+      });
+    }
+
+    if (
+      normalizedIdempotencyKey.length < 16 ||
+      normalizedIdempotencyKey.length > 200
+    ) {
+      return res.status(400).json({
+        error:
+          "The transfer request idempotency key is invalid.",
+      });
+    }
+
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+      await client.query("BEGIN");
+      transactionStarted = true;
+
+      /*
+        Idempotency check:
+        retrying the same browser request returns the original
+        pending intent rather than inserting a duplicate record.
+      */
+      const existingIntentResult =
+        await client.query(
+          `
+          select
+            id,
+            tracker_id,
+            created_by,
+            from_bank_account_id,
+            to_bank_account_id,
+            amount,
+            transfer_date,
+            transfer_status
+          from public.bank_account_transfers
+          where plaid_idempotency_key = $1
+          limit 1
+          for update
+          `,
+          [normalizedIdempotencyKey]
+        );
+
+      const existingIntent =
+        existingIntentResult.rows[0];
+
+      if (existingIntent) {
+        const sameRequest =
+          existingIntent.tracker_id === trackerId &&
+          existingIntent.created_by ===
+            authenticatedUserId &&
+          existingIntent.from_bank_account_id ===
+            from_bank_account_id &&
+          existingIntent.to_bank_account_id ===
+            to_bank_account_id &&
+          Number(existingIntent.amount) ===
+            normalizedAmount &&
+          String(existingIntent.transfer_date) ===
+            transfer_date;
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        if (!sameRequest) {
+          return res.status(409).json({
+            error:
+              "This idempotency key was already used for a different transfer request.",
+          });
+        }
+
+        return res.json({
+          success: true,
+          idempotent: true,
+          transfer_id: existingIntent.id,
+          transfer_status:
+            existingIntent.transfer_status,
+          message:
+            "The pending transfer request was already recorded. No money has moved.",
+        });
+      }
+
+      /*
+        Confirm both local bank-account records:
+        - belong to this tracker;
+        - are active;
+        - are Plaid-backed;
+        - have the same authenticated owner on both the local
+          account and the linked Plaid account.
+      */
+      const accountsResult = await client.query(
+        `
+        select
+          bank.id,
+          bank.active,
+          bank.source_type,
+          bank.plaid_linked_account_id,
+          bank.owner_user_id as bank_owner_user_id,
+
+          linked.id as linked_account_id,
+          linked.owner_user_id as linked_owner_user_id
+
+        from public.bank_accounts as bank
+
+        join public.linked_accounts as linked
+          on linked.id::text =
+             bank.plaid_linked_account_id
+         and linked.tracker_id =
+             bank.tracker_id
+
+        where bank.tracker_id = $1
+          and bank.id in ($2, $3)
+        for update
+        `,
+        [
+          trackerId,
+          from_bank_account_id,
+          to_bank_account_id,
+        ]
+      );
+
+      if (accountsResult.rows.length !== 2) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(400).json({
+          error:
+            "Both selected bank accounts must be active Plaid-linked accounts in this tracker.",
+        });
+      }
+
+      const accountById = new Map(
+        accountsResult.rows.map(account => [
+          account.id,
+          account,
+        ])
+      );
+
+      const sourceAccount = accountById.get(
+        from_bank_account_id
+      );
+
+      const destinationAccount = accountById.get(
+        to_bank_account_id
+      );
+
+      const accountsAreEligible = [
+        sourceAccount,
+        destinationAccount,
+      ].every(account => {
+        const plaidBacked =
+          account.source_type === "plaid" ||
+          Boolean(account.plaid_linked_account_id);
+
+        const ownedBySignedInUser =
+          account.bank_owner_user_id ===
+            authenticatedUserId &&
+          account.linked_owner_user_id ===
+            authenticatedUserId;
+
+        return (
+          account &&
+          account.active !== false &&
+          plaidBacked &&
+          ownedBySignedInUser
+        );
+      });
+
+      if (!accountsAreEligible) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(403).json({
+          error:
+            "Live transfer requests require two active Plaid-linked bank accounts owned by the signed-in user.",
+        });
+      }
+
+      /*
+        This is intentionally only an intent record.
+
+        - No provider request is submitted.
+        - cash_moved remains false.
+        - No settled/submitted/provider fields are written.
+      */
+      const insertResult = await client.query(
+        `
+        insert into public.bank_account_transfers (
+          tracker_id,
+          from_bank_account_id,
+          to_bank_account_id,
+          amount,
+          transfer_date,
+          notes,
+          created_by,
+
+          transfer_mode,
+          transfer_status,
+          cash_moved,
+
+          plaid_idempotency_key,
+          requested_at
+        )
+        values (
+          $1, $2, $3, $4, $5, $6, $7,
+          'provider_intent',
+          'pending',
+          false,
+          $8,
+          now()
+        )
+        returning
+          id,
+          transfer_status,
+          requested_at
+        `,
+        [
+          trackerId,
+          from_bank_account_id,
+          to_bank_account_id,
+          normalizedAmount,
+          transfer_date,
+          normalizedNotes || null,
+          authenticatedUserId,
+          normalizedIdempotencyKey,
+        ]
+      );
+
+      const transfer = insertResult.rows[0];
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      console.log(
+        "BANK-TRANSFER-INTENT created:",
+        {
+          transfer_id: transfer.id,
+          tracker_id: trackerId,
+          created_by: authenticatedUserId,
+          transfer_status: transfer.transfer_status,
+        }
+      );
+
+      return res.status(201).json({
+        success: true,
+        transfer_id: transfer.id,
+        transfer_status: transfer.transfer_status,
+        requested_at: transfer.requested_at,
+        message:
+          "Pending transfer intent recorded. No money has moved.",
+      });
+
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "BANK-TRANSFER-INTENT rollback error:",
+            rollbackError
+          );
+        }
+      }
+
+      console.error(
+        "create-bank-transfer error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to create the pending bank-transfer intent.",
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
 function getTimeZoneParts(date, timezone) {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone || "UTC",
