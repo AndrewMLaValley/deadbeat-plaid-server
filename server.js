@@ -1567,74 +1567,13 @@ app.post(
 
 // Get linked accounts for a tracker
 app.get(
-  '/linked-accounts',
-  requireVerifiedTrackerMember,
-  async (req, res) => {
-  console.log('LINKED-ACCOUNTS endpoint hit');
-
-  const authHeader = req.headers.authorization || '';
-  const jwt = authHeader.replace('Bearer ', '').trim();
-  if (!jwt) {
-    console.log('LINKED-ACCOUNTS missing JWT');
-    return res.status(401).json({ error: 'Missing JWT' });
-  }
-
-  const { tracker_id } = req.query;
-  if (!tracker_id) {
-    console.log('LINKED-ACCOUNTS missing tracker_id');
-    return res.status(400).json({ error: 'tracker_id is required' });
-  }
-
-  console.log('LINKED-ACCOUNTS for tracker_id:', tracker_id);
-
-  try {
-    const { rows } = await pool.query(
-      `
-      select
-        id,
-        tracker_id,
-        plaid_item_id,
-        plaid_account_id,
-     coalesce(
-  owner_user_id = $2,
-  false
-) as is_owned_by_current_user,
-        institution_name,
-        plaid_account_name,
-        plaid_account_mask,
-        plaid_account_type,
-        plaid_account_subtype,
-        current_balance,
-        available_balance
-      from public.linked_accounts
-      where tracker_id = $1
-      order by institution_name, plaid_account_name
-      `,
-     [
-  req.authenticatedTrackerId,
-  req.authenticatedUserId,
-],  
-    );
-
-    console.log('LINKED-ACCOUNTS: found', rows.length, 'accounts');
-    return res.json({ accounts: rows });
-  } catch (err) {
-    console.error('linked-accounts error FULL:', err);
-    return res.status(500).json({
-      error: 'Failed to fetch linked accounts',
-      details: err.message || String(err),
-    });
-  }
-});
-
 /*
-  STEP 6 — REFRESH PLAID-LINKED ACCOUNT BALANCES
+  STEP 7 — REFRESH PLAID-LINKED ACCOUNT BALANCES
+  WITH PER-ACCOUNT STATUS AND ERROR RECORDING
 
-  This route retrieves updated balance data for Plaid Items
-  owned by the signed-in tracker member.
-
-  It does not create a transfer, submit money movement, or
-  change tracker-ledger balances.
+  This route reads balance information only.
+  It does not create transfers, move money, or alter
+  tracker-ledger balances.
 */
 app.post(
   "/refresh-linked-account-balances",
@@ -1647,8 +1586,6 @@ app.post(
     try {
       /*
         Only refresh Plaid Items owned by the signed-in user.
-        Do not expose or refresh another shared-tracker member's
-        linked institution.
       */
       const { rows: plaidItems } =
         await pool.query(
@@ -1671,6 +1608,7 @@ app.post(
         return res.json({
           success: true,
           refreshed_accounts: [],
+          errors: [],
           message:
             "No Plaid-linked accounts owned by the signed-in user were available to refresh."
         });
@@ -1679,11 +1617,6 @@ app.post(
       const refreshedAccounts = [];
       const refreshErrors = [];
 
-      /*
-        Refresh one Item at a time. A problem refreshing one
-        institution does not prevent other owned institutions
-        from returning updated balance data.
-      */
       for (const item of plaidItems) {
         try {
           const accessToken =
@@ -1706,11 +1639,16 @@ app.post(
                 update public.linked_accounts
                 set
                   current_balance = $3,
-                  available_balance = $4
+                  available_balance = $4,
+                  balance_refreshed_at = now(),
+                  balance_refresh_status = 'success',
+                  balance_refresh_error = null
+
                 where tracker_id = $1
                   and plaid_item_id = $2
                   and plaid_account_id = $5
                   and owner_user_id = $6
+
                 returning
                   id,
                   plaid_item_id,
@@ -1719,7 +1657,10 @@ app.post(
                   plaid_account_name,
                   plaid_account_mask,
                   current_balance,
-                  available_balance
+                  available_balance,
+                  balance_refreshed_at,
+                  balance_refresh_status,
+                  balance_refresh_error
                 `,
                 [
                   trackerId,
@@ -1731,24 +1672,114 @@ app.post(
                 ]
               );
 
-            if (updateResult.rows.length) {
-              refreshedAccounts.push(
-                updateResult.rows[0]
-              );
+            const refreshedAccount =
+              updateResult.rows[0];
+
+            if (!refreshedAccount) {
+              continue;
             }
+
+            /*
+              Keep the local Saved Bank Accounts display record
+              synchronized with the backend-confirmed outcome.
+            */
+            await pool.query(
+              `
+              update public.bank_accounts
+              set
+                live_current_balance = $3,
+                live_available_balance = $4,
+                live_balance_as_of = $5,
+                live_balance_refresh_status = 'success',
+                live_balance_refresh_error = null
+
+              where tracker_id = $1
+                and plaid_linked_account_id = $2
+                and owner_user_id = $6
+              `,
+              [
+                trackerId,
+                String(refreshedAccount.id),
+                refreshedAccount.current_balance,
+                refreshedAccount.available_balance,
+                refreshedAccount.balance_refreshed_at,
+                authenticatedUserId
+              ]
+            );
+
+            refreshedAccounts.push(
+              refreshedAccount
+            );
           }
 
         } catch (error) {
+          const errorMessage = String(
+            error?.response?.data?.error_message ||
+            error?.response?.data?.display_message ||
+            error?.message ||
+            error
+          ).slice(0, 1000);
+
           console.error(
             "Plaid balance refresh failed for Item:",
             item.plaid_item_id,
             error
           );
 
+          /*
+            Mark all of this signed-in user's linked accounts
+            under the failed Item as error status. Preserve the
+            last successful balance and refresh timestamp.
+          */
+          const failedLinkedAccounts =
+            await pool.query(
+              `
+              update public.linked_accounts
+              set
+                balance_refresh_status = 'error',
+                balance_refresh_error = $4
+
+              where tracker_id = $1
+                and plaid_item_id = $2
+                and owner_user_id = $3
+
+              returning id
+              `,
+              [
+                trackerId,
+                item.plaid_item_id,
+                authenticatedUserId,
+                errorMessage
+              ]
+            );
+
+          for (
+            const failedAccount of
+            failedLinkedAccounts.rows
+          ) {
+            await pool.query(
+              `
+              update public.bank_accounts
+              set
+                live_balance_refresh_status = 'error',
+                live_balance_refresh_error = $3
+
+              where tracker_id = $1
+                and plaid_linked_account_id = $2
+                and owner_user_id = $4
+              `,
+              [
+                trackerId,
+                String(failedAccount.id),
+                errorMessage,
+                authenticatedUserId
+              ]
+            );
+          }
+
           refreshErrors.push({
             plaid_item_id: item.plaid_item_id,
-            error:
-              error?.message || String(error)
+            error: errorMessage
           });
         }
       }
