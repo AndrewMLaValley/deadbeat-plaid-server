@@ -3308,6 +3308,139 @@ async function recordPlaidSyncFailure(
     ]
   );
 }
+/*
+  STEP 8 — USER-REQUESTED PLAID TRANSACTION SYNC
+
+  This refreshes stored Plaid transaction data only for
+  the signed-in user's owned linked institutions.
+
+  It does not create tracker entries, alter tracker-ledger
+  balances, confirm recurring transfers, or move money.
+*/
+app.post(
+  "/refresh-plaid-transactions",
+  requireVerifiedTrackerMember,
+  async (req, res) => {
+    const trackerId = req.authenticatedTrackerId;
+
+    const authenticatedUserId =
+      req.authenticatedUserId;
+
+    const summary = {
+      items_processed: 0,
+      items_failed: 0,
+      item_results: []
+    };
+
+    try {
+      /*
+        Only retrieve Plaid Items belonging to both:
+        - the current tracker; and
+        - the signed-in tracker member.
+      */
+      const { rows: plaidItems } =
+        await pool.query(
+          `
+          select
+            tracker_id,
+            plaid_item_id,
+            access_token,
+            transactions_cursor
+          from public.plaid_items
+          where tracker_id = $1
+            and owner_user_id = $2
+          order by created_at asc
+          `,
+          [
+            trackerId,
+            authenticatedUserId
+          ]
+        );
+
+      if (!plaidItems.length) {
+        return res.json({
+          success: true,
+          summary,
+          message:
+            "No Plaid-linked institutions owned by the signed-in user were available to refresh."
+        });
+      }
+
+      for (const item of plaidItems) {
+        try {
+          const itemResult =
+            await syncPlaidItemTransactions(
+              item
+            );
+
+          summary.items_processed += 1;
+
+          summary.item_results.push({
+            plaid_item_id: item.plaid_item_id,
+            status: "synced",
+            ...itemResult
+          });
+
+        } catch (error) {
+          summary.items_failed += 1;
+
+          await recordPlaidSyncFailure(
+            item.plaid_item_id,
+            error
+          );
+
+          summary.item_results.push({
+            plaid_item_id: item.plaid_item_id,
+            status: "failed",
+            error:
+              error?.message || String(error)
+          });
+
+          console.error(
+            "User-requested Plaid transaction sync failed:",
+            {
+              tracker_id: trackerId,
+              plaid_item_id: item.plaid_item_id,
+              error:
+                error?.message || String(error)
+            }
+          );
+        }
+      }
+
+      console.log(
+        "USER-REQUESTED-PLAID-TRANSACTION-SYNC completed:",
+        {
+          tracker_id: trackerId,
+          items_processed:
+            summary.items_processed,
+          items_failed:
+            summary.items_failed
+        }
+      );
+
+      return res.json({
+        success: true,
+        summary,
+        message:
+          summary.items_failed
+            ? "Some linked institutions refreshed successfully. See the returned item status for any failures."
+            : "Linked bank transactions refreshed successfully."
+      });
+
+    } catch (error) {
+      console.error(
+        "refresh-plaid-transactions error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to refresh linked bank transactions."
+      });
+    }
+  }
+);
 function utcCalendarDate(year, monthIndex, requestedDay) {
   const lastDayOfMonth = new Date(
     Date.UTC(year, monthIndex + 1, 0)
