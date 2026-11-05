@@ -2120,7 +2120,100 @@ app.post(
     }
   }
 );
+/*
+  STEP 5 — CANCEL PENDING BANK-TRANSFER INTENT
 
+  This only cancels an internal pending intent record.
+  It does not call Plaid, Dwolla, or any bank.
+  It cannot cancel a completed, submitted, settled,
+  returned, or cash-moved transfer.
+*/
+app.post(
+  "/cancel-bank-transfer",
+  requireVerifiedTrackerMember,
+  async (req, res) => {
+    try {
+      const transferId = String(
+        req.body?.transfer_id ||
+        req.body?.transferId ||
+        ""
+      ).trim();
+
+      if (!transferId) {
+        return res.status(400).json({
+          error: "A transfer_id is required."
+        });
+      }
+
+      const result = await pool.query(
+        `
+        update public.bank_account_transfers
+        set transfer_status = 'cancelled'
+
+        where id = $1
+          and tracker_id = $2
+          and created_by = $3
+          and transfer_mode = 'provider_intent'
+          and transfer_status = 'pending'
+          and coalesce(cash_moved, false) = false
+
+        returning
+          id,
+          transfer_mode,
+          transfer_status,
+          cash_moved,
+          amount,
+          transfer_date,
+          notes,
+          requested_at
+        `,
+        [
+          transferId,
+          req.authenticatedTrackerId,
+          req.authenticatedUserId
+        ]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          error:
+            "No eligible pending transfer intent was found. " +
+            "Only your own pending, no-money-moved intents " +
+            "may be cancelled."
+        });
+      }
+
+      const transfer = result.rows[0];
+
+      console.log(
+        "BANK-TRANSFER-INTENT cancelled:",
+        {
+          transfer_id: transfer.id,
+          tracker_id: req.authenticatedTrackerId,
+          cancelled_by: req.authenticatedUserId
+        }
+      );
+
+      return res.json({
+        success: true,
+        transfer,
+        message:
+          "Pending transfer intent cancelled. No money moved."
+      });
+
+    } catch (error) {
+      console.error(
+        "cancel-bank-transfer error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Unable to cancel the pending transfer intent."
+      });
+    }
+  }
+);
 function getTimeZoneParts(date, timezone) {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone || "UTC",
